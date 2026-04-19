@@ -548,6 +548,8 @@ void Storage::PopulateUpdatableData(const SharedDataIndex &index)
         std::uint32_t graph_connectivity_checksum = 0;
         contractor::files::readGraph(
             config.GetPath(".osrm.hsgr"), metrics, graph_connectivity_checksum);
+        *index.GetBlockPtr<std::uint32_t>("/ch/connectivity_checksum") =
+            graph_connectivity_checksum;
 
         if (config.IsRequiredConfiguredInput("osrm.edges"))
         {
@@ -579,6 +581,8 @@ void Storage::PopulateUpdatableData(const SharedDataIndex &index)
         std::uint32_t graph_connectivity_checksum = 0;
         customizer::files::readGraph(
             config.GetPath(".osrm.mldgr"), graph_view, graph_connectivity_checksum);
+        *index.GetBlockPtr<std::uint32_t>("/mld/connectivity_checksum") =
+            graph_connectivity_checksum;
 
         if (config.IsRequiredConfiguredInput("osrm.edges"))
         {

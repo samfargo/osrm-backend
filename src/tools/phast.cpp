@@ -1371,9 +1371,10 @@ bool validateFacadeMetadata(const CHDataFacade &facade,
 {
     if (facade.GetCheckSum() != phast_data.connectivity_checksum)
     {
-        util::Log(logWARNING) << "Facade checksum (" << facade.GetCheckSum()
-                              << ") differs from PHAST connectivity checksum ("
-                              << phast_data.connectivity_checksum << ").";
+        util::Log(logERROR) << "Facade checksum (" << facade.GetCheckSum()
+                            << ") differs from PHAST connectivity checksum ("
+                            << phast_data.connectivity_checksum << ").";
+        return false;
     }
     if (std::string{facade.GetWeightName()} != metric_name)
     {
@@ -1879,6 +1880,11 @@ try
     }
     util::Log() << "Seed metric: "
                 << (seed_metric_kind == SeedMetricKind::Weight ? "weight" : "duration");
+    if (metric_name == "duration")
+    {
+        util::Log()
+            << "Dataset weight_name=duration, so weight and duration seed offsets are equivalent.";
+    }
 
     std::vector<PHASTSeed> seeds;
     SeedBuildStats seed_stats;
