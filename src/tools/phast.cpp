@@ -9,7 +9,9 @@
 #include "osrm/coordinate.hpp"
 #include "osrm/exception.hpp"
 #include "storage/io_config.hpp"
+#include "storage/serialization.hpp"
 #include "storage/storage_config.hpp"
+#include "storage/tar.hpp"
 #include "util/integer_range.hpp"
 #include "util/log.hpp"
 #include "util/meminfo.hpp"
@@ -55,8 +57,20 @@ struct RuntimeConfig final
     bool has_seed_file = false;
     std::filesystem::path poi_file;
     bool has_poi_file = false;
-    std::string seed_metric = "weight";
-    double cap_seconds = -1.;
+    std::string metric = "weight";
+    std::string seed_metric;
+    bool has_seed_metric = false;
+    double cap_seconds = 0.;
+    bool has_cap_seconds = false;
+    std::uint64_t cap_weight = 0;
+    bool has_cap_weight = false;
+    std::size_t exclude_index = std::numeric_limits<std::size_t>::max();
+    bool has_exclude_index = false;
+    std::string orientation;
+    bool has_orientation = false;
+    std::string output_format = "phastfield-v1";
+    std::filesystem::path output_path;
+    bool has_output_path = false;
     std::size_t debug_mismatch_limit = 0;
     std::size_t debug_arc_sample_limit = 8;
 };
@@ -68,10 +82,16 @@ enum class return_code : unsigned
     exit
 };
 
-enum class SeedMetricKind : std::uint8_t
+enum class MetricKind : std::uint8_t
 {
     Weight = 0,
     Duration = 1
+};
+
+enum class OutputFormatKind : std::uint8_t
+{
+    PhastFieldV1 = 0,
+    RawU32 = 1
 };
 
 enum class SeedClass : std::uint8_t
@@ -88,6 +108,24 @@ struct PHASTSeed
     EdgeWeight cost = INVALID_EDGE_WEIGHT;
     SeedClass seed_class = SeedClass::Bidirectional;
 };
+
+constexpr std::uint32_t PHASTFIELD_SCHEMA_VERSION = 1;
+constexpr std::uint32_t PHASTFIELD_NO_CAP = std::numeric_limits<std::uint32_t>::max();
+
+bool parseOrientationString(const std::string &value, contractor::PHASTOrientation &orientation)
+{
+    if (value == "forward")
+    {
+        orientation = contractor::PHASTOrientation::Forward;
+        return true;
+    }
+    if (value == "reverse")
+    {
+        orientation = contractor::PHASTOrientation::Reverse;
+        return true;
+    }
+    return false;
+}
 
 return_code
 parseArguments(int argc,
@@ -116,13 +154,31 @@ parseArguments(int argc,
         "poi-file",
         boost::program_options::value<std::filesystem::path>(&runtime_config.poi_file),
         "Path to a text file containing one POI coordinate per line as 'lon,lat'")(
+        "metric",
+        boost::program_options::value<std::string>(&runtime_config.metric)->default_value("weight"),
+        "Traversal metric: weight|duration")(
         "seed-metric",
-        boost::program_options::value<std::string>(&runtime_config.seed_metric)
-            ->default_value("weight"),
-        "Seed offset metric: weight|duration")(
+        boost::program_options::value<std::string>(&runtime_config.seed_metric),
+        "Seed offset metric override: weight|duration (default: --metric)")(
         "cap-seconds",
         boost::program_options::value<double>(&runtime_config.cap_seconds),
-        "Optional traversal cap in seconds")(
+        "Traversal cap in seconds")(
+        "cap-weight",
+        boost::program_options::value<std::uint64_t>(&runtime_config.cap_weight),
+        "Traversal cap in metric ticks (required for non-duration weight datasets)")(
+        "exclude",
+        boost::program_options::value<std::size_t>(&runtime_config.exclude_index),
+        "Expected exclude index (must match .osrm.phast)")(
+        "orientation",
+        boost::program_options::value<std::string>(&runtime_config.orientation),
+        "Expected orientation: forward|reverse (must match .osrm.phast)")(
+        "output-format",
+        boost::program_options::value<std::string>(&runtime_config.output_format)
+            ->default_value("phastfield-v1"),
+        "Output format: phastfield-v1|raw-u32")(
+        "output",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.output_path),
+        "Output path (default: <input>.phastfield or <input>.phastfield.raw_u32)")(
         "debug-mismatches",
         boost::program_options::value<std::size_t>(&runtime_config.debug_mismatch_limit)
             ->implicit_value(8),
@@ -199,6 +255,35 @@ parseArguments(int argc,
     {
         runtime_config.has_poi_file = true;
     }
+    if (option_variables.contains("seed-metric"))
+    {
+        runtime_config.has_seed_metric = true;
+    }
+    else
+    {
+        runtime_config.seed_metric = runtime_config.metric;
+    }
+    if (option_variables.contains("cap-seconds"))
+    {
+        runtime_config.has_cap_seconds = true;
+    }
+    if (option_variables.contains("cap-weight"))
+    {
+        runtime_config.has_cap_weight = true;
+    }
+    if (option_variables.contains("exclude"))
+    {
+        runtime_config.has_exclude_index = true;
+    }
+    if (option_variables.contains("orientation"))
+    {
+        runtime_config.has_orientation = true;
+    }
+    if (option_variables.contains("output"))
+    {
+        runtime_config.has_output_path = true;
+    }
+
     const bool has_manual_seeds = !runtime_config.seed_nodes.empty() || runtime_config.has_seed_file;
     if (has_manual_seeds == runtime_config.has_poi_file)
     {
@@ -206,15 +291,40 @@ parseArguments(int argc,
             << "Provide exactly one seed source: --poi-file or --seed-node/--seed-file.";
         return return_code::fail;
     }
-    if (option_variables.contains("cap-seconds") && runtime_config.cap_seconds < 0.)
+    if ((runtime_config.metric != "weight") && (runtime_config.metric != "duration"))
+    {
+        util::Log(logERROR) << "--metric must be 'weight' or 'duration'.";
+        return return_code::fail;
+    }
+    if ((runtime_config.seed_metric != "weight") && (runtime_config.seed_metric != "duration"))
+    {
+        util::Log(logERROR) << "--seed-metric must be 'weight' or 'duration'.";
+        return return_code::fail;
+    }
+    if (runtime_config.has_cap_seconds &&
+        (!std::isfinite(runtime_config.cap_seconds) || runtime_config.cap_seconds < 0.))
     {
         util::Log(logERROR) << "--cap-seconds must be >= 0.";
         return return_code::fail;
     }
-    if (runtime_config.seed_metric != "weight" && runtime_config.seed_metric != "duration")
+    if (runtime_config.has_cap_seconds && runtime_config.has_cap_weight)
     {
-        util::Log(logERROR) << "--seed-metric must be 'weight' or 'duration'.";
+        util::Log(logERROR) << "Specify at most one traversal cap: --cap-seconds or --cap-weight.";
         return return_code::fail;
+    }
+    if (runtime_config.output_format != "phastfield-v1" && runtime_config.output_format != "raw-u32")
+    {
+        util::Log(logERROR) << "--output-format must be 'phastfield-v1' or 'raw-u32'.";
+        return return_code::fail;
+    }
+    if (runtime_config.has_orientation)
+    {
+        contractor::PHASTOrientation orientation;
+        if (!parseOrientationString(runtime_config.orientation, orientation))
+        {
+            util::Log(logERROR) << "--orientation must be 'forward' or 'reverse'.";
+            return return_code::fail;
+        }
     }
     if (runtime_config.debug_mismatch_limit > 0 && runtime_config.debug_arc_sample_limit == 0)
     {
@@ -405,9 +515,31 @@ bool classifyArc(const contractor::PhastData &phast_data,
     return true;
 }
 
+bool extractArcCost(const contractor::QueryEdge::EdgeData &edge_data,
+                    const MetricKind metric_kind,
+                    EdgeWeight &edge_cost)
+{
+    if (metric_kind == MetricKind::Duration)
+    {
+        const auto duration_value = static_cast<std::int64_t>(edge_data.duration);
+        const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+        if (duration_value <= 0 || duration_value > max_valid)
+        {
+            return false;
+        }
+        edge_cost = to_alias<EdgeWeight>(duration_value);
+        return true;
+    }
+
+    edge_cost = edge_data.weight;
+    return edge_cost > EdgeWeight{0} && edge_cost != INVALID_EDGE_WEIGHT;
+}
+
 bool deriveAdjacency(const contractor::QueryGraph &graph,
                      const std::vector<bool> &edge_filter,
                      const contractor::PhastData &phast_data,
+                     const contractor::PHASTOrientation orientation,
+                     const MetricKind metric_kind,
                      DerivedAdjacency &adjacency)
 {
     const auto node_count = phast_data.node_count;
@@ -431,7 +563,7 @@ bool deriveAdjacency(const contractor::QueryGraph &graph,
             }
             const auto target = graph.GetTarget(edge);
             const auto &edge_data = graph.GetEdgeData(edge);
-            if (!usesArc(edge_data, phast_data.orientation))
+            if (!usesArc(edge_data, orientation))
             {
                 continue;
             }
@@ -440,10 +572,10 @@ bool deriveAdjacency(const contractor::QueryGraph &graph,
                 ++adjacency.skipped_self_loops;
                 continue;
             }
-            const auto edge_weight = edge_data.weight;
-            if (edge_weight <= EdgeWeight{0} || edge_weight == INVALID_EDGE_WEIGHT)
+            EdgeWeight edge_weight = INVALID_EDGE_WEIGHT;
+            if (!extractArcCost(edge_data, metric_kind, edge_weight))
             {
-                util::Log(logERROR) << "Encountered invalid arc weight on edge " << source << " -> "
+                util::Log(logERROR) << "Encountered invalid arc cost on edge " << source << " -> "
                                     << target;
                 return false;
             }
@@ -502,7 +634,7 @@ bool deriveAdjacency(const contractor::QueryGraph &graph,
             }
             const auto target = graph.GetTarget(edge);
             const auto &edge_data = graph.GetEdgeData(edge);
-            if (!usesArc(edge_data, phast_data.orientation))
+            if (!usesArc(edge_data, orientation))
             {
                 continue;
             }
@@ -510,7 +642,13 @@ bool deriveAdjacency(const contractor::QueryGraph &graph,
             {
                 continue;
             }
-            const auto edge_weight = edge_data.weight;
+            EdgeWeight edge_weight = INVALID_EDGE_WEIGHT;
+            if (!extractArcCost(edge_data, metric_kind, edge_weight))
+            {
+                util::Log(logERROR) << "Encountered invalid arc cost on edge " << source << " -> "
+                                    << target;
+                return false;
+            }
 
             bool is_upward = false;
             if (!classifyArc(phast_data, source, target, is_upward))
@@ -854,28 +992,102 @@ const char *seedClassToString(const SeedClass seed_class)
     return "unknown";
 }
 
-bool parseSeedMetricKind(const RuntimeConfig &runtime_config,
-                         const std::string &weight_name,
-                         SeedMetricKind &seed_metric_kind)
+bool parseMetricKind(const std::string &metric_name,
+                     const std::string &weight_name,
+                     const char *option_name,
+                     MetricKind &metric_kind)
 {
-    if (runtime_config.seed_metric == "weight")
+    if (metric_name == "weight")
     {
-        seed_metric_kind = SeedMetricKind::Weight;
+        metric_kind = MetricKind::Weight;
         return true;
     }
-    if (runtime_config.seed_metric == "duration")
+    if (metric_name == "duration")
     {
         if (weight_name != "duration")
         {
-            util::Log(logERROR) << "--seed-metric=duration requires a duration-weighted dataset.";
+            util::Log(logERROR) << option_name
+                                << "=duration requires a duration-weighted dataset.";
             return false;
         }
-        seed_metric_kind = SeedMetricKind::Duration;
+        metric_kind = MetricKind::Duration;
         return true;
     }
 
-    util::Log(logERROR) << "Unknown seed metric: " << runtime_config.seed_metric;
+    util::Log(logERROR) << option_name << " must be 'weight' or 'duration'.";
     return false;
+}
+
+bool parseOutputFormatKind(const std::string &output_format, OutputFormatKind &output_format_kind)
+{
+    if (output_format == "phastfield-v1")
+    {
+        output_format_kind = OutputFormatKind::PhastFieldV1;
+        return true;
+    }
+    if (output_format == "raw-u32")
+    {
+        output_format_kind = OutputFormatKind::RawU32;
+        return true;
+    }
+    return false;
+}
+
+bool resolveExcludeIndex(const RuntimeConfig &runtime_config,
+                         const contractor::PhastData &phast_data,
+                         std::size_t &exclude_index)
+{
+    exclude_index = phast_data.exclude_index;
+    if (!runtime_config.has_exclude_index)
+    {
+        return true;
+    }
+    if (runtime_config.exclude_index != phast_data.exclude_index)
+    {
+        util::Log(logERROR) << "--exclude=" << runtime_config.exclude_index
+                            << " does not match .osrm.phast exclude index "
+                            << phast_data.exclude_index << ".";
+        return false;
+    }
+    return true;
+}
+
+bool resolveOrientation(const RuntimeConfig &runtime_config,
+                        const contractor::PhastData &phast_data,
+                        contractor::PHASTOrientation &orientation)
+{
+    orientation = phast_data.orientation;
+    if (!runtime_config.has_orientation)
+    {
+        return true;
+    }
+
+    contractor::PHASTOrientation requested_orientation;
+    if (!parseOrientationString(runtime_config.orientation, requested_orientation))
+    {
+        util::Log(logERROR) << "Invalid orientation: " << runtime_config.orientation;
+        return false;
+    }
+    if (requested_orientation != phast_data.orientation)
+    {
+        util::Log(logERROR) << "--orientation=" << runtime_config.orientation
+                            << " does not match .osrm.phast orientation "
+                            << orientationToString(phast_data.orientation) << ".";
+        return false;
+    }
+
+    orientation = requested_orientation;
+    return true;
+}
+
+std::filesystem::path defaultOutputPath(const std::filesystem::path &base_path,
+                                        const OutputFormatKind output_format_kind)
+{
+    if (output_format_kind == OutputFormatKind::RawU32)
+    {
+        return std::filesystem::path(base_path.string() + ".phastfield.raw_u32");
+    }
+    return std::filesystem::path(base_path.string() + ".phastfield");
 }
 
 bool loadManualSeedFile(const std::filesystem::path &seed_file, std::vector<NodeID> &seed_nodes)
@@ -1089,10 +1301,10 @@ bool loadPOIFile(const std::filesystem::path &poi_file, std::vector<POIRecord> &
 
 bool convertSeedCost(const engine::PhantomNode &phantom,
                      const bool forward_state,
-                     const SeedMetricKind seed_metric_kind,
+                     const MetricKind seed_metric_kind,
                      EdgeWeight &seed_cost)
 {
-    if (seed_metric_kind == SeedMetricKind::Duration)
+    if (seed_metric_kind == MetricKind::Duration)
     {
         const auto duration =
             forward_state ? phantom.GetForwardDuration() : phantom.GetReverseDuration();
@@ -1148,7 +1360,7 @@ SeedClass classifyTargetSeed(const bool forward_valid, const bool reverse_valid)
 
 bool buildPOISeeds(const RuntimeConfig &runtime_config,
                    const std::uint32_t node_count,
-                   const SeedMetricKind seed_metric_kind,
+                   const MetricKind seed_metric_kind,
                    const CHDataFacade &facade,
                    std::vector<PHASTSeed> &seeds,
                    SeedBuildStats &stats)
@@ -1389,36 +1601,246 @@ bool validateFacadeMetadata(const CHDataFacade &facade,
     return true;
 }
 
-bool parseCapWeight(const RuntimeConfig &runtime_config,
-                    const extractor::ProfileProperties &properties,
-                    std::optional<EdgeWeight> &cap_weight)
+bool convertCapTicks(const std::int64_t ticks, const char *option_name, EdgeWeight &cap_metric)
 {
-    cap_weight = std::nullopt;
-    if (runtime_config.cap_seconds < 0.)
+    const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+    if (ticks < 0 || ticks > max_valid)
     {
+        util::Log(logERROR) << option_name << " is out of range.";
+        return false;
+    }
+    cap_metric = to_alias<EdgeWeight>(ticks);
+    return true;
+}
+
+bool parseTraversalCap(const RuntimeConfig &runtime_config,
+                       const extractor::ProfileProperties &properties,
+                       const MetricKind metric_kind,
+                       std::optional<EdgeWeight> &cap_metric)
+{
+    cap_metric = std::nullopt;
+
+    if (metric_kind == MetricKind::Duration)
+    {
+        if (!runtime_config.has_cap_seconds)
+        {
+            util::Log(logERROR) << "--metric=duration requires --cap-seconds.";
+            return false;
+        }
+
+        const auto ticks = static_cast<std::int64_t>(std::ceil(runtime_config.cap_seconds * 10.));
+        EdgeWeight converted = INVALID_EDGE_WEIGHT;
+        if (!convertCapTicks(ticks, "--cap-seconds", converted))
+        {
+            return false;
+        }
+        cap_metric = converted;
         return true;
     }
-    if (!std::isfinite(runtime_config.cap_seconds))
+
+    if (runtime_config.has_cap_seconds)
     {
-        util::Log(logERROR) << "--cap-seconds must be finite.";
-        return false;
+        if (properties.GetWeightName() != "duration")
+        {
+            util::Log(logERROR)
+                << "--cap-seconds requires weight_name=duration when --metric=weight.";
+            return false;
+        }
+
+        const auto ticks = static_cast<std::int64_t>(
+            std::ceil(runtime_config.cap_seconds * properties.GetWeightMultiplier()));
+        EdgeWeight converted = INVALID_EDGE_WEIGHT;
+        if (!convertCapTicks(ticks, "--cap-seconds", converted))
+        {
+            return false;
+        }
+        cap_metric = converted;
+        return true;
+    }
+
+    if (runtime_config.has_cap_weight)
+    {
+        const auto ticks = static_cast<std::int64_t>(runtime_config.cap_weight);
+        EdgeWeight converted = INVALID_EDGE_WEIGHT;
+        if (!convertCapTicks(ticks, "--cap-weight", converted))
+        {
+            return false;
+        }
+        cap_metric = converted;
+        return true;
     }
 
     if (properties.GetWeightName() != "duration")
     {
-        util::Log(logERROR) << "--cap-seconds requires weight_name=duration.";
+        util::Log(logERROR)
+            << "--metric=weight requires --cap-weight for non-duration-weighted datasets.";
         return false;
     }
 
-    const auto cap_ticks = static_cast<std::int64_t>(
-        std::ceil(runtime_config.cap_seconds * properties.GetWeightMultiplier()));
-    const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
-    if (cap_ticks < 0 || cap_ticks > max_valid)
+    return true;
+}
+
+bool shouldUseU16Encoding(const std::vector<EdgeWeight> &distances,
+                          const std::optional<EdgeWeight> &cap_metric)
+{
+    const auto u16_sentinel = static_cast<std::int64_t>(std::numeric_limits<std::uint16_t>::max());
+    if (cap_metric.has_value() && from_alias<std::int64_t>(cap_metric.value()) >= u16_sentinel)
     {
-        util::Log(logERROR) << "--cap-seconds is out of range.";
         return false;
     }
-    cap_weight = to_alias<EdgeWeight>(cap_ticks);
+    for (const auto distance : distances)
+    {
+        if (distance == INVALID_EDGE_WEIGHT)
+        {
+            continue;
+        }
+        if (from_alias<std::int64_t>(distance) >= u16_sentinel)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool encodeDistancesToU16(const std::vector<EdgeWeight> &distances, std::vector<std::uint16_t> &encoded)
+{
+    constexpr auto sentinel = std::numeric_limits<std::uint16_t>::max();
+    encoded.resize(distances.size());
+    for (const auto i : util::irange<std::size_t>(0, distances.size()))
+    {
+        const auto distance = distances[i];
+        if (distance == INVALID_EDGE_WEIGHT)
+        {
+            encoded[i] = sentinel;
+            continue;
+        }
+
+        const auto value = from_alias<std::int64_t>(distance);
+        if (value < 0 || value >= static_cast<std::int64_t>(sentinel))
+        {
+            util::Log(logERROR) << "Distance value " << value << " cannot be encoded as uint16.";
+            return false;
+        }
+        encoded[i] = static_cast<std::uint16_t>(value);
+    }
+    return true;
+}
+
+bool encodeDistancesToU32(const std::vector<EdgeWeight> &distances, std::vector<std::uint32_t> &encoded)
+{
+    constexpr auto sentinel = std::numeric_limits<std::uint32_t>::max();
+    encoded.resize(distances.size());
+    for (const auto i : util::irange<std::size_t>(0, distances.size()))
+    {
+        const auto distance = distances[i];
+        if (distance == INVALID_EDGE_WEIGHT)
+        {
+            encoded[i] = sentinel;
+            continue;
+        }
+
+        const auto value = from_alias<std::int64_t>(distance);
+        if (value < 0 || value >= static_cast<std::int64_t>(sentinel))
+        {
+            util::Log(logERROR) << "Distance value " << value << " cannot be encoded as uint32.";
+            return false;
+        }
+        encoded[i] = static_cast<std::uint32_t>(value);
+    }
+    return true;
+}
+
+bool writePhastFieldV1(const std::filesystem::path &path,
+                       const std::vector<EdgeWeight> &distances,
+                       const std::optional<EdgeWeight> &cap_metric,
+                       const std::string &metric_name,
+                       const MetricKind metric_kind,
+                       const contractor::PHASTOrientation orientation,
+                       const std::size_t exclude_index,
+                       const std::uint32_t connectivity_checksum,
+                       const std::size_t poi_count)
+{
+    try
+    {
+        storage::tar::FileWriter writer(path, storage::tar::FileWriter::GenerateFingerprint);
+        const auto metric_kind_value = static_cast<std::uint32_t>(metric_kind);
+        const auto orientation_value = static_cast<std::uint32_t>(orientation);
+        const auto cap_value =
+            cap_metric.has_value() ? static_cast<std::uint32_t>(from_alias<std::int64_t>(cap_metric.value()))
+                                   : PHASTFIELD_NO_CAP;
+        const auto node_count = static_cast<std::uint32_t>(distances.size());
+        const auto exclude_value = static_cast<std::uint32_t>(exclude_index);
+        const auto poi_count_value = static_cast<std::uint32_t>(poi_count);
+
+        writer.WriteElementCount64("/phast_result/meta/schema_version", 1);
+        writer.WriteFrom("/phast_result/meta/schema_version", PHASTFIELD_SCHEMA_VERSION);
+        writer.WriteElementCount64("/phast_result/meta/connectivity_checksum", 1);
+        writer.WriteFrom("/phast_result/meta/connectivity_checksum", connectivity_checksum);
+        storage::serialization::write(writer, "/phast_result/meta/metric_name", metric_name);
+        writer.WriteElementCount64("/phast_result/meta/metric_kind", 1);
+        writer.WriteFrom("/phast_result/meta/metric_kind", metric_kind_value);
+        writer.WriteElementCount64("/phast_result/meta/orientation", 1);
+        writer.WriteFrom("/phast_result/meta/orientation", orientation_value);
+        writer.WriteElementCount64("/phast_result/meta/exclude_index", 1);
+        writer.WriteFrom("/phast_result/meta/exclude_index", exclude_value);
+        writer.WriteElementCount64("/phast_result/meta/cap_metric", 1);
+        writer.WriteFrom("/phast_result/meta/cap_metric", cap_value);
+        writer.WriteElementCount64("/phast_result/meta/node_count", 1);
+        writer.WriteFrom("/phast_result/meta/node_count", node_count);
+        writer.WriteElementCount64("/phast_result/meta/poi_count", 1);
+        writer.WriteFrom("/phast_result/meta/poi_count", poi_count_value);
+
+        if (shouldUseU16Encoding(distances, cap_metric))
+        {
+            std::vector<std::uint16_t> costs_u16;
+            if (!encodeDistancesToU16(distances, costs_u16))
+            {
+                return false;
+            }
+            storage::serialization::write(writer, "/phast_result/costs_u16", costs_u16);
+        }
+        else
+        {
+            std::vector<std::uint32_t> costs_u32;
+            if (!encodeDistancesToU32(distances, costs_u32))
+            {
+                return false;
+            }
+            storage::serialization::write(writer, "/phast_result/costs_u32", costs_u32);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        util::Log(logERROR) << "Failed to write phastfield output: " << e.what();
+        return false;
+    }
+
+    return true;
+}
+
+bool writeRawU32(const std::filesystem::path &path, const std::vector<EdgeWeight> &distances)
+{
+    std::vector<std::uint32_t> encoded;
+    if (!encodeDistancesToU32(distances, encoded))
+    {
+        return false;
+    }
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output)
+    {
+        util::Log(logERROR) << "Could not open output file for writing: " << path.string();
+        return false;
+    }
+
+    output.write(reinterpret_cast<const char *>(encoded.data()),
+                 static_cast<std::streamsize>(encoded.size() * sizeof(std::uint32_t)));
+    if (!output)
+    {
+        util::Log(logERROR) << "Failed to write output file: " << path.string();
+        return false;
+    }
+
     return true;
 }
 
@@ -1845,8 +2267,47 @@ try
         return EXIT_FAILURE;
     }
 
+    MetricKind runtime_metric_kind = MetricKind::Weight;
+    if (!parseMetricKind(runtime_config.metric, metric_name, "--metric", runtime_metric_kind))
+    {
+        return EXIT_FAILURE;
+    }
+    MetricKind seed_metric_kind = MetricKind::Weight;
+    if (!parseMetricKind(runtime_config.seed_metric, metric_name, "--seed-metric", seed_metric_kind))
+    {
+        return EXIT_FAILURE;
+    }
+    if (seed_metric_kind != runtime_metric_kind && metric_name != "duration")
+    {
+        util::Log(logERROR)
+            << "--seed-metric must match --metric unless weight_name=duration.";
+        return EXIT_FAILURE;
+    }
+
+    OutputFormatKind output_format_kind = OutputFormatKind::PhastFieldV1;
+    if (!parseOutputFormatKind(runtime_config.output_format, output_format_kind))
+    {
+        util::Log(logERROR) << "Unsupported output format: " << runtime_config.output_format;
+        return EXIT_FAILURE;
+    }
+
+    std::size_t selected_exclude_index = phast_data.exclude_index;
+    if (!resolveExcludeIndex(runtime_config, phast_data, selected_exclude_index))
+    {
+        return EXIT_FAILURE;
+    }
+    contractor::PHASTOrientation selected_orientation = phast_data.orientation;
+    if (!resolveOrientation(runtime_config, phast_data, selected_orientation))
+    {
+        return EXIT_FAILURE;
+    }
+
+    const auto output_path = runtime_config.has_output_path
+                                 ? runtime_config.output_path
+                                 : defaultOutputPath(phast_config.base_path, output_format_kind);
+
     std::shared_ptr<const CHDataFacade> facade;
-    if (!loadCHFacade(phast_config.base_path, metric_name, phast_data.exclude_index, facade))
+    if (!loadCHFacade(phast_config.base_path, metric_name, selected_exclude_index, facade))
     {
         return EXIT_FAILURE;
     }
@@ -1855,12 +2316,20 @@ try
         return EXIT_FAILURE;
     }
 
-    const auto &selected_edge_filter = metric.edge_filter[phast_data.exclude_index];
+    const auto &selected_edge_filter = metric.edge_filter[selected_exclude_index];
     DerivedAdjacency adjacency;
-    if (!deriveAdjacency(graph, selected_edge_filter, phast_data, adjacency))
+    if (!deriveAdjacency(
+            graph, selected_edge_filter, phast_data, selected_orientation, runtime_metric_kind, adjacency))
     {
         return EXIT_FAILURE;
     }
+
+    util::Log() << "Runtime metric: "
+                << (runtime_metric_kind == MetricKind::Weight ? "weight" : "duration");
+    util::Log() << "Runtime exclude index: " << selected_exclude_index;
+    util::Log() << "Runtime orientation: " << orientationToString(selected_orientation);
+    util::Log() << "Output format: " << runtime_config.output_format;
+    util::Log() << "Output path: " << output_path.string();
 
     util::Log() << "Derived upward arcs: " << adjacency.up_targets.size();
     util::Log() << "Derived downward arcs: " << adjacency.down_targets.size();
@@ -1872,14 +2341,8 @@ try
                     << runtime_config.debug_mismatch_limit << " mismatches.";
         logDerivedArcSamples(phast_data, adjacency, runtime_config.debug_arc_sample_limit);
     }
-
-    SeedMetricKind seed_metric_kind = SeedMetricKind::Weight;
-    if (!parseSeedMetricKind(runtime_config, metric_name, seed_metric_kind))
-    {
-        return EXIT_FAILURE;
-    }
     util::Log() << "Seed metric: "
-                << (seed_metric_kind == SeedMetricKind::Weight ? "weight" : "duration");
+                << (seed_metric_kind == MetricKind::Weight ? "weight" : "duration");
     if (metric_name == "duration")
     {
         util::Log()
@@ -1926,15 +2389,14 @@ try
     printSeedPreview(seeds);
     util::Log() << "Seed count after dedup: " << seeds.size();
 
-    std::optional<EdgeWeight> cap_weight;
-    if (!parseCapWeight(runtime_config, properties, cap_weight))
+    std::optional<EdgeWeight> cap_metric;
+    if (!parseTraversalCap(runtime_config, properties, runtime_metric_kind, cap_metric))
     {
         return EXIT_FAILURE;
     }
-    if (cap_weight.has_value())
+    if (cap_metric.has_value())
     {
-        util::Log() << "Traversal cap: " << runtime_config.cap_seconds << "s ("
-                    << cap_weight.value() << " ticks)";
+        util::Log() << "Traversal cap: " << cap_metric.value() << " ticks";
     }
     else
     {
@@ -1945,11 +2407,11 @@ try
     std::size_t upward_settled_nodes = 0;
     std::size_t downward_updates = 0;
     const auto phast_start = std::chrono::steady_clock::now();
-    if (!runUpwardSearch(adjacency, seeds, cap_weight, phast_distances, upward_settled_nodes))
+    if (!runUpwardSearch(adjacency, seeds, cap_metric, phast_distances, upward_settled_nodes))
     {
         return EXIT_FAILURE;
     }
-    if (!runDownwardSweep(phast_data, adjacency, cap_weight, phast_distances, &downward_updates))
+    if (!runDownwardSweep(phast_data, adjacency, cap_metric, phast_distances, &downward_updates))
     {
         return EXIT_FAILURE;
     }
@@ -1964,7 +2426,7 @@ try
     const auto reference_start = std::chrono::steady_clock::now();
     if (!runReferenceDijkstra(adjacency,
                               seeds,
-                              cap_weight,
+                              cap_metric,
                               reference_distances,
                               dijkstra_settled_nodes,
                               reference_trace))
@@ -2001,7 +2463,7 @@ try
                                        phast_distances,
                                        reference_distances,
                                        reference_trace,
-                                       cap_weight,
+                                       cap_metric,
                                        node,
                                        runtime_config.debug_arc_sample_limit);
             }
@@ -2009,6 +2471,28 @@ try
         return EXIT_FAILURE;
     }
     util::Log() << "PHAST prototype matches Dijkstra baseline.";
+
+    const auto poi_count = runtime_config.has_poi_file ? seed_stats.poi_count : 0;
+    if (output_format_kind == OutputFormatKind::PhastFieldV1)
+    {
+        if (!writePhastFieldV1(output_path,
+                               phast_distances,
+                               cap_metric,
+                               metric_name,
+                               runtime_metric_kind,
+                               selected_orientation,
+                               selected_exclude_index,
+                               phast_data.connectivity_checksum,
+                               poi_count))
+        {
+            return EXIT_FAILURE;
+        }
+    }
+    else if (!writeRawU32(output_path, phast_distances))
+    {
+        return EXIT_FAILURE;
+    }
+    util::Log() << "Wrote PHAST field output: " << output_path.string();
 
     util::DumpMemoryStats();
     return EXIT_SUCCESS;
