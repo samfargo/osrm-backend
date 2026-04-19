@@ -48,6 +48,22 @@ inline void writeGraph(const std::filesystem::path &path,
         serialization::write(writer, "/ch/metrics/" + pair.first, pair.second);
     }
 }
+
+inline void readPhast(const std::filesystem::path &path, PhastData &data)
+{
+    const auto fingerprint = storage::tar::FileReader::VerifyFingerprint;
+    storage::tar::FileReader reader{path, fingerprint};
+
+    serialization::read(reader, "/phast", data);
+}
+
+inline void writePhast(const std::filesystem::path &path, const PhastData &data)
+{
+    const auto fingerprint = storage::tar::FileWriter::GenerateFingerprint;
+    storage::tar::FileWriter writer{path, fingerprint};
+
+    serialization::write(writer, "/phast", data);
+}
 } // namespace osrm::contractor::files
 
 #endif

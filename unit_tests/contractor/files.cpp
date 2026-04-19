@@ -55,4 +55,22 @@ BOOST_AUTO_TEST_CASE(read_write_hsgr)
                             reference_metrics["duration"].edge_filter[3]);
 }
 
+BOOST_AUTO_TEST_CASE(read_write_phast)
+{
+    const PhastData reference{
+        1, 0xDEADBEEF, 12345, "duration"
+    };
+
+    TemporaryFile tmp{TEST_DATA_DIR "/read_write_phast_test.osrm.phast"};
+    contractor::files::writePhast(tmp.path, reference);
+
+    PhastData result;
+    contractor::files::readPhast(tmp.path, result);
+
+    BOOST_CHECK_EQUAL(result.version, reference.version);
+    BOOST_CHECK_EQUAL(result.connectivity_checksum, reference.connectivity_checksum);
+    BOOST_CHECK_EQUAL(result.node_count, reference.node_count);
+    BOOST_CHECK_EQUAL(result.metric_name, reference.metric_name);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

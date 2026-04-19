@@ -90,11 +90,15 @@ int Contractor::Run()
     TIMER_STOP(contraction);
     util::Log() << "Contracted graph has " << query_graph.GetNumberOfEdges() << " edges.";
     util::Log() << "Contraction took " << TIMER_SEC(contraction) << " sec";
+    const auto node_count = query_graph.GetNumberOfNodes();
 
     std::unordered_map<std::string, ContractedMetric> metrics = {
         {metric_name, {std::move(query_graph), std::move(edge_filters)}}};
 
     files::writeGraph(config.GetPath(".osrm.hsgr"), metrics, connectivity_checksum);
+
+    const PhastData phast_data = {1, connectivity_checksum, node_count, metric_name};
+    files::writePhast(config.GetPath(".osrm.phast"), phast_data);
 
     TIMER_STOP(preparing);
 

@@ -2,6 +2,7 @@
 #define OSRM_CONTRACTOR_SERIALIZATION_HPP
 
 #include "contractor/contracted_metric.hpp"
+#include "contractor/phast_data.hpp"
 
 #include "util/serialization.hpp"
 
@@ -41,6 +42,22 @@ void read(storage::tar::FileReader &reader,
                                      name + "/exclude/" + std::to_string(index) + "/edge_filter",
                                      metric.edge_filter[index]);
     }
+}
+
+inline void write(storage::tar::FileWriter &writer, const std::string &name, const PhastData &data)
+{
+    writer.WriteFrom(name + "/version.meta", data.version);
+    writer.WriteFrom(name + "/connectivity_checksum.meta", data.connectivity_checksum);
+    writer.WriteFrom(name + "/node_count.meta", data.node_count);
+    storage::serialization::write(writer, name + "/metric_name", data.metric_name);
+}
+
+inline void read(storage::tar::FileReader &reader, const std::string &name, PhastData &data)
+{
+    reader.ReadInto(name + "/version.meta", data.version);
+    reader.ReadInto(name + "/connectivity_checksum.meta", data.connectivity_checksum);
+    reader.ReadInto(name + "/node_count.meta", data.node_count);
+    storage::serialization::read(reader, name + "/metric_name", data.metric_name);
 }
 } // namespace osrm::contractor::serialization
 
