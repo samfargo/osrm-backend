@@ -10,6 +10,12 @@
 namespace osrm::contractor
 {
 
+enum class PHASTOrientation : std::uint8_t
+{
+    Forward = 0,
+    Reverse = 1
+};
+
 struct PHASTOrdering
 {
     // sweep position -> original node id
@@ -27,7 +33,9 @@ struct PhastData
     std::uint32_t version = 0;
     std::uint32_t connectivity_checksum = 0;
     std::uint32_t node_count = 0;
+    std::uint32_t exclude_index = 0;
     std::string metric_name;
+    PHASTOrientation orientation = PHASTOrientation::Forward;
     PHASTOrdering ordering;
 };
 

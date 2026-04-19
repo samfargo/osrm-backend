@@ -58,10 +58,12 @@ BOOST_AUTO_TEST_CASE(read_write_hsgr)
 BOOST_AUTO_TEST_CASE(read_write_phast)
 {
     PhastData reference;
-    reference.version = 2;
+    reference.version = 3;
     reference.connectivity_checksum = 0xDEADBEEF;
     reference.node_count = 4;
+    reference.exclude_index = 0;
     reference.metric_name = "duration";
+    reference.orientation = PHASTOrientation::Reverse;
     reference.ordering.order = {2, 0, 3, 1};
     reference.ordering.rank = {1, 3, 0, 2};
     reference.ordering.contraction_to_original = {2, 0, 3, 1};
@@ -76,7 +78,10 @@ BOOST_AUTO_TEST_CASE(read_write_phast)
     BOOST_CHECK_EQUAL(result.version, reference.version);
     BOOST_CHECK_EQUAL(result.connectivity_checksum, reference.connectivity_checksum);
     BOOST_CHECK_EQUAL(result.node_count, reference.node_count);
+    BOOST_CHECK_EQUAL(result.exclude_index, reference.exclude_index);
     BOOST_CHECK_EQUAL(result.metric_name, reference.metric_name);
+    BOOST_CHECK_EQUAL(static_cast<std::uint32_t>(result.orientation),
+                      static_cast<std::uint32_t>(reference.orientation));
     CHECK_EQUAL_COLLECTIONS(result.ordering.order, reference.ordering.order);
     CHECK_EQUAL_COLLECTIONS(result.ordering.rank, reference.ordering.rank);
     CHECK_EQUAL_COLLECTIONS(result.ordering.contraction_to_original,

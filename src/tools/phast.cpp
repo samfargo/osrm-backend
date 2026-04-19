@@ -12,11 +12,13 @@
 #include <boost/program_options.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <sstream>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 using namespace osrm;
 
@@ -128,11 +130,35 @@ bool validateOrdering(const contractor::PhastData &phast_data)
         return false;
     }
 
+    for (const auto node : ordering.rank)
+    {
+        if (node >= node_count)
+        {
+            util::Log(logERROR) << "PHAST rank contains invalid node id.";
+            return false;
+        }
+    }
+
     for (const auto i : util::irange<std::size_t>(0, node_count))
     {
-        if (ordering.rank[ordering.order[i]] != i)
+        const auto node = ordering.order[i];
+        if (node >= node_count)
+        {
+            util::Log(logERROR) << "PHAST order contains invalid node id at position " << i;
+            return false;
+        }
+        if (ordering.rank[node] != i)
         {
             util::Log(logERROR) << "PHAST rank/order inverse mismatch at position " << i;
+            return false;
+        }
+    }
+
+    for (const auto local_id : util::irange<NodeID>(0, node_count))
+    {
+        if (ordering.contraction_to_original[local_id] >= node_count)
+        {
+            util::Log(logERROR) << "PHAST contraction_to_original contains invalid node id.";
             return false;
         }
     }
@@ -143,6 +169,203 @@ bool validateOrdering(const contractor::PhastData &phast_data)
         if (local_id >= node_count || ordering.contraction_to_original[local_id] != original_id)
         {
             util::Log(logERROR) << "PHAST permutation inverse mismatch at node " << original_id;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+const char *orientationToString(const contractor::PHASTOrientation orientation)
+{
+    switch (orientation)
+    {
+    case contractor::PHASTOrientation::Forward:
+        return "forward";
+    case contractor::PHASTOrientation::Reverse:
+        return "reverse";
+    }
+    return "unknown";
+}
+
+bool isValidOrientation(const contractor::PHASTOrientation orientation)
+{
+    return orientation == contractor::PHASTOrientation::Forward ||
+           orientation == contractor::PHASTOrientation::Reverse;
+}
+
+bool usesArc(const contractor::QueryEdge::EdgeData &edge_data,
+             const contractor::PHASTOrientation orientation)
+{
+    switch (orientation)
+    {
+    case contractor::PHASTOrientation::Forward:
+        return edge_data.forward;
+    case contractor::PHASTOrientation::Reverse:
+        return edge_data.backward;
+    }
+    return false;
+}
+
+bool validateMetadata(const std::string &metric_name,
+                      const contractor::ContractedMetric &metric,
+                      const std::uint32_t hsgr_checksum,
+                      const contractor::PhastData &phast_data)
+{
+    if (phast_data.version < 3)
+    {
+        util::Log(logERROR) << "Unsupported .osrm.phast version " << phast_data.version
+                            << ". Expected version >= 3.";
+        return false;
+    }
+    if (!isValidOrientation(phast_data.orientation))
+    {
+        util::Log(logERROR) << "Unsupported PHAST orientation value.";
+        return false;
+    }
+    if (metric_name != phast_data.metric_name)
+    {
+        util::Log(logERROR) << "Metric name mismatch between .osrm.properties and .osrm.phast";
+        return false;
+    }
+    if (hsgr_checksum != phast_data.connectivity_checksum)
+    {
+        util::Log(logERROR) << "Checksum mismatch between .osrm.hsgr and .osrm.phast";
+        return false;
+    }
+    if (metric.graph.GetNumberOfNodes() != phast_data.node_count)
+    {
+        util::Log(logERROR) << "Node count mismatch between .osrm.hsgr and .osrm.phast";
+        return false;
+    }
+    if (phast_data.exclude_index >= metric.edge_filter.size())
+    {
+        util::Log(logERROR) << "PHAST exclude index " << phast_data.exclude_index
+                            << " is out of range for this CH metric.";
+        return false;
+    }
+    return true;
+}
+
+struct DerivedAdjacency
+{
+    std::vector<std::uint32_t> up_offsets;
+    std::vector<NodeID> up_targets;
+    std::vector<std::uint32_t> down_offsets;
+    std::vector<NodeID> down_targets;
+    std::size_t skipped_self_loops = 0;
+};
+
+bool classifyArc(const contractor::PhastData &phast_data,
+                 const NodeID source,
+                 const NodeID target,
+                 bool &is_upward)
+{
+    const auto source_rank = phast_data.ordering.rank[source];
+    const auto target_rank = phast_data.ordering.rank[target];
+    if (source_rank == target_rank)
+    {
+        util::Log(logERROR) << "Rank tie detected for edge " << source << " -> " << target;
+        return false;
+    }
+
+    is_upward = source_rank < target_rank;
+    return true;
+}
+
+bool deriveAdjacency(const contractor::QueryGraph &graph,
+                     const contractor::PhastData &phast_data,
+                     DerivedAdjacency &adjacency)
+{
+    const auto node_count = phast_data.node_count;
+    adjacency.up_offsets.assign(node_count + 1, 0);
+    adjacency.down_offsets.assign(node_count + 1, 0);
+
+    for (const auto source : util::irange<NodeID>(0, node_count))
+    {
+        for (const auto edge : graph.GetAdjacentEdgeRange(source))
+        {
+            const auto target = graph.GetTarget(edge);
+            const auto &edge_data = graph.GetEdgeData(edge);
+            if (!usesArc(edge_data, phast_data.orientation))
+            {
+                continue;
+            }
+            if (source == target)
+            {
+                ++adjacency.skipped_self_loops;
+                continue;
+            }
+
+            bool is_upward = false;
+            if (!classifyArc(phast_data, source, target, is_upward))
+            {
+                return false;
+            }
+
+            if (is_upward)
+            {
+                ++adjacency.up_offsets[source + 1];
+            }
+            else
+            {
+                ++adjacency.down_offsets[source + 1];
+            }
+        }
+    }
+
+    for (const auto index : util::irange<std::size_t>(1, adjacency.up_offsets.size()))
+    {
+        adjacency.up_offsets[index] += adjacency.up_offsets[index - 1];
+        adjacency.down_offsets[index] += adjacency.down_offsets[index - 1];
+    }
+
+    adjacency.up_targets.resize(adjacency.up_offsets.back());
+    adjacency.down_targets.resize(adjacency.down_offsets.back());
+
+    auto up_cursor = adjacency.up_offsets;
+    auto down_cursor = adjacency.down_offsets;
+
+    for (const auto source : util::irange<NodeID>(0, node_count))
+    {
+        for (const auto edge : graph.GetAdjacentEdgeRange(source))
+        {
+            const auto target = graph.GetTarget(edge);
+            const auto &edge_data = graph.GetEdgeData(edge);
+            if (!usesArc(edge_data, phast_data.orientation))
+            {
+                continue;
+            }
+            if (source == target)
+            {
+                continue;
+            }
+
+            bool is_upward = false;
+            if (!classifyArc(phast_data, source, target, is_upward))
+            {
+                return false;
+            }
+
+            auto &cursor = is_upward ? up_cursor[source] : down_cursor[source];
+            const auto limit =
+                is_upward ? adjacency.up_offsets[source + 1] : adjacency.down_offsets[source + 1];
+            auto &targets = is_upward ? adjacency.up_targets : adjacency.down_targets;
+            if (cursor >= limit)
+            {
+                util::Log(logERROR) << "Derived adjacency buffer overflow for source node " << source;
+                return false;
+            }
+            targets[cursor++] = target;
+        }
+    }
+
+    for (const auto source : util::irange<NodeID>(0, node_count))
+    {
+        if (up_cursor[source] != adjacency.up_offsets[source + 1] ||
+            down_cursor[source] != adjacency.down_offsets[source + 1])
+        {
+            util::Log(logERROR) << "Derived adjacency fill mismatch for source node " << source;
             return false;
         }
     }
@@ -206,12 +429,15 @@ try
     contractor::PhastData phast_data;
     contractor::files::readPhast(phast_config.GetPath(".osrm.phast"), phast_data);
 
-    const auto &graph = metrics.at(metric_name).graph;
+    const auto &metric = metrics.at(metric_name);
+    const auto &graph = metric.graph;
     util::Log() << "CH metric: " << metric_name;
     util::Log() << "CH nodes: " << graph.GetNumberOfNodes() << ", edges: " << graph.GetNumberOfEdges();
     util::Log() << "PHAST version: " << phast_data.version;
     util::Log() << "PHAST metric: " << phast_data.metric_name;
     util::Log() << "PHAST nodes: " << phast_data.node_count;
+    util::Log() << "PHAST exclude index: " << phast_data.exclude_index;
+    util::Log() << "PHAST orientation: " << orientationToString(phast_data.orientation);
     util::Log() << "PHAST checksum: " << phast_data.connectivity_checksum;
     util::Log() << "HSGR checksum: " << hsgr_checksum;
     util::Log() << "PHAST order size: " << phast_data.ordering.order.size();
@@ -223,18 +449,24 @@ try
     printArrayPreview("PHAST c2o preview", phast_data.ordering.contraction_to_original);
     printArrayPreview("PHAST o2c preview", phast_data.ordering.original_to_contraction);
 
-    if (metric_name != phast_data.metric_name)
+    if (!validateMetadata(metric_name, metric, hsgr_checksum, phast_data))
     {
-        util::Log(logWARNING) << "Metric name mismatch between .osrm.properties and .osrm.phast";
-    }
-    if (hsgr_checksum != phast_data.connectivity_checksum)
-    {
-        util::Log(logWARNING) << "Checksum mismatch between .osrm.hsgr and .osrm.phast";
+        return EXIT_FAILURE;
     }
     if (!validateOrdering(phast_data))
     {
         return EXIT_FAILURE;
     }
+
+    DerivedAdjacency adjacency;
+    if (!deriveAdjacency(graph, phast_data, adjacency))
+    {
+        return EXIT_FAILURE;
+    }
+
+    util::Log() << "Derived upward arcs: " << adjacency.up_targets.size();
+    util::Log() << "Derived downward arcs: " << adjacency.down_targets.size();
+    util::Log() << "Skipped self-loop arcs: " << adjacency.skipped_self_loops;
 
     util::DumpMemoryStats();
     return EXIT_SUCCESS;

@@ -46,9 +46,12 @@ void read(storage::tar::FileReader &reader,
 
 inline void write(storage::tar::FileWriter &writer, const std::string &name, const PhastData &data)
 {
+    const auto orientation = static_cast<std::uint32_t>(data.orientation);
     writer.WriteFrom(name + "/version.meta", data.version);
     writer.WriteFrom(name + "/connectivity_checksum.meta", data.connectivity_checksum);
     writer.WriteFrom(name + "/node_count.meta", data.node_count);
+    writer.WriteFrom(name + "/exclude_index.meta", data.exclude_index);
+    writer.WriteFrom(name + "/orientation.meta", orientation);
     storage::serialization::write(writer, name + "/metric_name", data.metric_name);
     storage::serialization::write(writer, name + "/order", data.ordering.order);
     storage::serialization::write(writer, name + "/rank", data.ordering.rank);
@@ -62,9 +65,13 @@ inline void write(storage::tar::FileWriter &writer, const std::string &name, con
 
 inline void read(storage::tar::FileReader &reader, const std::string &name, PhastData &data)
 {
+    std::uint32_t orientation = 0;
     reader.ReadInto(name + "/version.meta", data.version);
     reader.ReadInto(name + "/connectivity_checksum.meta", data.connectivity_checksum);
     reader.ReadInto(name + "/node_count.meta", data.node_count);
+    reader.ReadInto(name + "/exclude_index.meta", data.exclude_index);
+    reader.ReadInto(name + "/orientation.meta", orientation);
+    data.orientation = static_cast<PHASTOrientation>(orientation);
     storage::serialization::read(reader, name + "/metric_name", data.metric_name);
     storage::serialization::read(reader, name + "/order", data.ordering.order);
     storage::serialization::read(reader, name + "/rank", data.ordering.rank);

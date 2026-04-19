@@ -83,12 +83,13 @@ int Contractor::Run()
     QueryGraph query_graph;
     std::vector<std::vector<bool>> edge_filters;
     PHASTOrdering ordering;
+    const std::size_t phast_exclude_index = 0;
     std::tie(query_graph, edge_filters) =
         contractExcludableGraph(toContractorGraph(number_of_edge_based_nodes, edge_based_edge_list),
                                 std::move(node_weights),
                                 node_filters,
                                 &ordering,
-                                0);
+                                phast_exclude_index);
     TIMER_STOP(contraction);
     util::Log() << "Contracted graph has " << query_graph.GetNumberOfEdges() << " edges.";
     util::Log() << "Contraction took " << TIMER_SEC(contraction) << " sec";
@@ -130,10 +131,12 @@ int Contractor::Run()
     }
 
     PhastData phast_data;
-    phast_data.version = 2;
+    phast_data.version = 3;
     phast_data.connectivity_checksum = connectivity_checksum;
     phast_data.node_count = node_count;
+    phast_data.exclude_index = static_cast<std::uint32_t>(phast_exclude_index);
     phast_data.metric_name = metric_name;
+    phast_data.orientation = PHASTOrientation::Reverse;
     phast_data.ordering = std::move(ordering);
     files::writePhast(config.GetPath(".osrm.phast"), phast_data);
 
