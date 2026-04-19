@@ -58,7 +58,7 @@ BOOST_AUTO_TEST_CASE(read_write_hsgr)
 BOOST_AUTO_TEST_CASE(read_write_phast)
 {
     PhastData reference;
-    reference.version = 3;
+    reference.version = PHAST_SCHEMA_VERSION;
     reference.connectivity_checksum = 0xDEADBEEF;
     reference.node_count = 4;
     reference.exclude_index = 0;

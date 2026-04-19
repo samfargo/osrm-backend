@@ -10,6 +10,8 @@
 namespace osrm::contractor
 {
 
+inline constexpr std::uint32_t PHAST_SCHEMA_VERSION = 3;
+
 enum class PHASTOrientation : std::uint8_t
 {
     Forward = 0,

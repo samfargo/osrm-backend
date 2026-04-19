@@ -131,7 +131,7 @@ int Contractor::Run()
     }
 
     PhastData phast_data;
-    phast_data.version = 3;
+    phast_data.version = PHAST_SCHEMA_VERSION;
     phast_data.connectivity_checksum = connectivity_checksum;
     phast_data.node_count = node_count;
     phast_data.exclude_index = static_cast<std::uint32_t>(phast_exclude_index);
