@@ -50,6 +50,14 @@ inline void write(storage::tar::FileWriter &writer, const std::string &name, con
     writer.WriteFrom(name + "/connectivity_checksum.meta", data.connectivity_checksum);
     writer.WriteFrom(name + "/node_count.meta", data.node_count);
     storage::serialization::write(writer, name + "/metric_name", data.metric_name);
+    storage::serialization::write(writer, name + "/order", data.ordering.order);
+    storage::serialization::write(writer, name + "/rank", data.ordering.rank);
+    storage::serialization::write(writer,
+                                  name + "/permutation/contraction_to_original",
+                                  data.ordering.contraction_to_original);
+    storage::serialization::write(writer,
+                                  name + "/permutation/original_to_contraction",
+                                  data.ordering.original_to_contraction);
 }
 
 inline void read(storage::tar::FileReader &reader, const std::string &name, PhastData &data)
@@ -58,6 +66,14 @@ inline void read(storage::tar::FileReader &reader, const std::string &name, Phas
     reader.ReadInto(name + "/connectivity_checksum.meta", data.connectivity_checksum);
     reader.ReadInto(name + "/node_count.meta", data.node_count);
     storage::serialization::read(reader, name + "/metric_name", data.metric_name);
+    storage::serialization::read(reader, name + "/order", data.ordering.order);
+    storage::serialization::read(reader, name + "/rank", data.ordering.rank);
+    storage::serialization::read(reader,
+                                 name + "/permutation/contraction_to_original",
+                                 data.ordering.contraction_to_original);
+    storage::serialization::read(reader,
+                                 name + "/permutation/original_to_contraction",
+                                 data.ordering.original_to_contraction);
 }
 } // namespace osrm::contractor::serialization
 

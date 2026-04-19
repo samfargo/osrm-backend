@@ -4,14 +4,17 @@
 #include "extractor/profile_properties.hpp"
 #include "osrm/exception.hpp"
 #include "storage/io_config.hpp"
+#include "util/integer_range.hpp"
 #include "util/log.hpp"
 #include "util/meminfo.hpp"
 #include "util/version.hpp"
 
 #include <boost/program_options.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <sstream>
 #include <set>
 #include <unordered_map>
 
@@ -107,6 +110,62 @@ parseArguments(int argc, char *argv[], std::string &verbosity, PhastConfig &phas
 
     return return_code::ok;
 }
+
+bool validateOrdering(const contractor::PhastData &phast_data)
+{
+    const auto node_count = phast_data.node_count;
+    const auto &ordering = phast_data.ordering;
+
+    if (ordering.order.size() != node_count || ordering.rank.size() != node_count)
+    {
+        util::Log(logERROR) << "PHAST ordering size mismatch.";
+        return false;
+    }
+    if (ordering.contraction_to_original.size() != node_count ||
+        ordering.original_to_contraction.size() != node_count)
+    {
+        util::Log(logERROR) << "PHAST permutation size mismatch.";
+        return false;
+    }
+
+    for (const auto i : util::irange<std::size_t>(0, node_count))
+    {
+        if (ordering.rank[ordering.order[i]] != i)
+        {
+            util::Log(logERROR) << "PHAST rank/order inverse mismatch at position " << i;
+            return false;
+        }
+    }
+
+    for (const auto original_id : util::irange<NodeID>(0, node_count))
+    {
+        const auto local_id = ordering.original_to_contraction[original_id];
+        if (local_id >= node_count || ordering.contraction_to_original[local_id] != original_id)
+        {
+            util::Log(logERROR) << "PHAST permutation inverse mismatch at node " << original_id;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void printArrayPreview(const char *label, const std::vector<NodeID> &values)
+{
+    std::ostringstream out;
+    out << label << " [";
+    const auto preview = std::min<std::size_t>(values.size(), 5);
+    for (const auto i : util::irange<std::size_t>(0, preview))
+    {
+        if (i > 0)
+            out << ", ";
+        out << values[i];
+    }
+    if (values.size() > preview)
+        out << ", ...";
+    out << "]";
+    util::Log() << out.str();
+}
 } // namespace
 
 int main(int argc, char *argv[])
@@ -155,6 +214,14 @@ try
     util::Log() << "PHAST nodes: " << phast_data.node_count;
     util::Log() << "PHAST checksum: " << phast_data.connectivity_checksum;
     util::Log() << "HSGR checksum: " << hsgr_checksum;
+    util::Log() << "PHAST order size: " << phast_data.ordering.order.size();
+    util::Log() << "PHAST rank size: " << phast_data.ordering.rank.size();
+    util::Log() << "PHAST c2o size: " << phast_data.ordering.contraction_to_original.size();
+    util::Log() << "PHAST o2c size: " << phast_data.ordering.original_to_contraction.size();
+    printArrayPreview("PHAST order preview", phast_data.ordering.order);
+    printArrayPreview("PHAST rank preview", phast_data.ordering.rank);
+    printArrayPreview("PHAST c2o preview", phast_data.ordering.contraction_to_original);
+    printArrayPreview("PHAST o2c preview", phast_data.ordering.original_to_contraction);
 
     if (metric_name != phast_data.metric_name)
     {
@@ -163,6 +230,10 @@ try
     if (hsgr_checksum != phast_data.connectivity_checksum)
     {
         util::Log(logWARNING) << "Checksum mismatch between .osrm.hsgr and .osrm.phast";
+    }
+    if (!validateOrdering(phast_data))
+    {
+        return EXIT_FAILURE;
     }
 
     util::DumpMemoryStats();

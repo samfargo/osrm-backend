@@ -551,7 +551,8 @@ std::vector<bool> contractGraph(ContractorGraph &graph,
                                 std::vector<bool> node_is_uncontracted_,
                                 std::vector<bool> node_is_contractable_,
                                 std::vector<EdgeWeight> node_weights_,
-                                double core_factor)
+                                double core_factor,
+                                PHASTOrdering *ordering_out)
 {
     BOOST_ASSERT(node_weights_.size() == graph.GetNumberOfNodes());
 
@@ -573,6 +574,15 @@ std::vector<bool> contractGraph(ContractorGraph &graph,
     std::vector<NodeID> new_to_old_node_id(number_of_nodes);
     // Fill the map with an identiy mapping
     std::iota(new_to_old_node_id.begin(), new_to_old_node_id.end(), 0);
+
+    if (ordering_out != nullptr)
+    {
+        ordering_out->order.clear();
+        ordering_out->rank.clear();
+        ordering_out->contraction_to_original.clear();
+        ordering_out->original_to_contraction.clear();
+        ordering_out->order.reserve(number_of_nodes);
+    }
 
     ContractorNodeData node_data{graph.GetNumberOfNodes(),
                                  std::move(node_is_uncontracted_),
@@ -682,7 +692,13 @@ std::vector<bool> contractGraph(ContractorGraph &graph,
         for (auto position :
              util::irange<std::size_t>(begin_independent_nodes_idx, end_independent_nodes_idx))
         {
-            node_data.is_core[remaining_nodes[position].id] = false;
+            const auto current_id = remaining_nodes[position].id;
+            node_data.is_core[current_id] = false;
+            if (ordering_out != nullptr)
+            {
+                // Capture original node id while the locality-renumbered id map is still live.
+                ordering_out->order.push_back(new_to_old_node_id[current_id]);
+            }
         }
 
         tbb::parallel_for(
@@ -754,6 +770,23 @@ std::vector<bool> contractGraph(ContractorGraph &graph,
         p.PrintStatus(number_of_contracted_nodes);
     }
 
+    if (ordering_out != nullptr)
+    {
+        ordering_out->contraction_to_original = new_to_old_node_id;
+        ordering_out->original_to_contraction.assign(number_of_nodes, SPECIAL_NODEID);
+        for (const auto local_id : util::irange<NodeID>(0, number_of_nodes))
+        {
+            const auto original_id = ordering_out->contraction_to_original[local_id];
+            ordering_out->original_to_contraction[original_id] = local_id;
+        }
+
+        ordering_out->rank.assign(number_of_nodes, SPECIAL_NODEID);
+        for (const auto position : util::irange<std::size_t>(0, ordering_out->order.size()))
+        {
+            ordering_out->rank[ordering_out->order[position]] = static_cast<NodeID>(position);
+        }
+    }
+
     node_data.Renumber(new_to_old_node_id);
     RenumberGraph(graph, new_to_old_node_id);
 
@@ -775,10 +808,11 @@ std::vector<bool> contractGraph(ContractorGraph &graph,
 using GraphAndFilter = std::tuple<QueryGraph, std::vector<std::vector<bool>>>;
 
 GraphAndFilter contractFullGraph(ContractorGraph contractor_graph,
-                                 std::vector<EdgeWeight> node_weights)
+                                 std::vector<EdgeWeight> node_weights,
+                                 PHASTOrdering *ordering_out)
 {
     auto num_nodes = contractor_graph.GetNumberOfNodes();
-    contractGraph(contractor_graph, std::move(node_weights));
+    contractGraph(contractor_graph, std::move(node_weights), 1.0, ordering_out);
 
     auto edges = toEdges<QueryEdge>(std::move(contractor_graph));
     std::vector<bool> edge_filter(edges.size(), true);
@@ -788,13 +822,19 @@ GraphAndFilter contractFullGraph(ContractorGraph contractor_graph,
 
 GraphAndFilter contractExcludableGraph(ContractorGraph contractor_graph_,
                                        std::vector<EdgeWeight> node_weights,
-                                       const std::vector<std::vector<bool>> &filters)
+                                       const std::vector<std::vector<bool>> &filters,
+                                       PHASTOrdering *ordering_out,
+                                       std::size_t ordering_filter_index)
 {
+    BOOST_ASSERT(!filters.empty());
+    BOOST_ASSERT(ordering_filter_index < filters.size());
+
     if (filters.size() == 1)
     {
         if (std::all_of(filters.front().begin(), filters.front().end(), [](auto v) { return v; }))
         {
-            return contractFullGraph(std::move(contractor_graph_), std::move(node_weights));
+            return contractFullGraph(
+                std::move(contractor_graph_), std::move(node_weights), ordering_out);
         }
     }
 
@@ -802,6 +842,8 @@ GraphAndFilter contractExcludableGraph(ContractorGraph contractor_graph_,
     ContractedEdgeContainer edge_container;
     ContractorGraph shared_core_graph;
     std::vector<bool> is_shared_core;
+    PHASTOrdering shared_ordering;
+    PHASTOrdering filter_ordering;
     {
         ContractorGraph contractor_graph = std::move(contractor_graph_);
         std::vector<bool> always_allowed(num_nodes, true);
@@ -817,8 +859,12 @@ GraphAndFilter contractExcludableGraph(ContractorGraph contractor_graph_,
         // a very dense core. This increases the overall graph sizes a little bit
         // but increases the final CH quality and contraction speed.
         constexpr float BASE_CORE = 0.9f;
-        is_shared_core =
-            contractGraph(contractor_graph, std::move(always_allowed), node_weights, BASE_CORE);
+        auto *shared_ordering_ptr = ordering_out != nullptr ? &shared_ordering : nullptr;
+        is_shared_core = contractGraph(contractor_graph,
+                                       std::move(always_allowed),
+                                       node_weights,
+                                       BASE_CORE,
+                                       shared_ordering_ptr);
 
         // Add all non-core edges to container
         {
@@ -843,14 +889,38 @@ GraphAndFilter contractExcludableGraph(ContractorGraph contractor_graph_,
                                                     { return is_shared_core[node]; });
     }
 
-    for (const auto &filter : filters)
+    for (const auto filter_index : util::irange<std::size_t>(0, filters.size()))
     {
+        const auto &filter = filters[filter_index];
         auto filtered_core_graph =
             shared_core_graph.Filter([&filter](const NodeID node) { return filter[node]; });
 
-        contractGraph(filtered_core_graph, is_shared_core, is_shared_core, node_weights);
+        auto *filter_ordering_ptr =
+            (ordering_out != nullptr && filter_index == ordering_filter_index) ? &filter_ordering
+                                                                                : nullptr;
+        contractGraph(filtered_core_graph,
+                      is_shared_core,
+                      is_shared_core,
+                      node_weights,
+                      1.0,
+                      filter_ordering_ptr);
 
         edge_container.Merge(toEdges<QueryEdge>(std::move(filtered_core_graph)));
+    }
+
+    if (ordering_out != nullptr)
+    {
+        ordering_out->order = std::move(shared_ordering.order);
+        ordering_out->order.insert(ordering_out->order.end(),
+                                   filter_ordering.order.begin(),
+                                   filter_ordering.order.end());
+        ordering_out->rank.assign(num_nodes, SPECIAL_NODEID);
+        for (const auto position : util::irange<std::size_t>(0, ordering_out->order.size()))
+        {
+            ordering_out->rank[ordering_out->order[position]] = static_cast<NodeID>(position);
+        }
+        ordering_out->contraction_to_original = std::move(filter_ordering.contraction_to_original);
+        ordering_out->original_to_contraction = std::move(filter_ordering.original_to_contraction);
     }
 
     return GraphAndFilter{QueryGraph{num_nodes, edge_container.edges},

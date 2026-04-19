@@ -82,11 +82,13 @@ int Contractor::Run()
 
     QueryGraph query_graph;
     std::vector<std::vector<bool>> edge_filters;
-    std::vector<std::vector<bool>> cores;
+    PHASTOrdering ordering;
     std::tie(query_graph, edge_filters) =
         contractExcludableGraph(toContractorGraph(number_of_edge_based_nodes, edge_based_edge_list),
                                 std::move(node_weights),
-                                node_filters);
+                                node_filters,
+                                &ordering,
+                                0);
     TIMER_STOP(contraction);
     util::Log() << "Contracted graph has " << query_graph.GetNumberOfEdges() << " edges.";
     util::Log() << "Contraction took " << TIMER_SEC(contraction) << " sec";
@@ -97,7 +99,42 @@ int Contractor::Run()
 
     files::writeGraph(config.GetPath(".osrm.hsgr"), metrics, connectivity_checksum);
 
-    const PhastData phast_data = {1, connectivity_checksum, node_count, metric_name};
+    if (ordering.order.size() != node_count)
+    {
+        throw util::exception("Invalid PHAST ordering: order size mismatch.");
+    }
+    if (ordering.rank.size() != node_count)
+    {
+        throw util::exception("Invalid PHAST ordering: rank size mismatch.");
+    }
+    if (ordering.contraction_to_original.size() != node_count ||
+        ordering.original_to_contraction.size() != node_count)
+    {
+        throw util::exception("Invalid PHAST ordering: permutation size mismatch.");
+    }
+
+    for (const auto i : util::irange<std::size_t>(0, node_count))
+    {
+        if (ordering.rank[ordering.order[i]] != i)
+        {
+            throw util::exception("Invalid PHAST ordering: rank/order inverse mismatch.");
+        }
+    }
+    for (const auto original_id : util::irange<NodeID>(0, node_count))
+    {
+        const auto local_id = ordering.original_to_contraction[original_id];
+        if (local_id >= node_count || ordering.contraction_to_original[local_id] != original_id)
+        {
+            throw util::exception("Invalid PHAST ordering: permutation inverse mismatch.");
+        }
+    }
+
+    PhastData phast_data;
+    phast_data.version = 2;
+    phast_data.connectivity_checksum = connectivity_checksum;
+    phast_data.node_count = node_count;
+    phast_data.metric_name = metric_name;
+    phast_data.ordering = std::move(ordering);
     files::writePhast(config.GetPath(".osrm.phast"), phast_data);
 
     TIMER_STOP(preparing);

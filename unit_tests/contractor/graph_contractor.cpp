@@ -1,6 +1,7 @@
 #include "contractor/graph_contractor.hpp"
 
 #include "contractor/contractor_graph.hpp"
+#include "util/integer_range.hpp"
 #include "helper.hpp"
 
 #include <boost/test/unit_test.hpp>
@@ -166,6 +167,32 @@ BOOST_AUTO_TEST_CASE(contract_excludable_graph)
 
         NOT(1, 3)
         NOT(3, 1)
+    }
+}
+
+BOOST_AUTO_TEST_CASE(contract_graph_captures_ordering)
+{
+    const ContractorGraph g = makeGraph({{0, 1, 1}, {1, 2, 1}, {2, 3, 1}, {3, 0, 1}});
+
+    auto query_graph = g;
+    PHASTOrdering ordering;
+    contractGraph(query_graph, {{1}, {1}, {1}, {1}}, 1.0, &ordering);
+
+    BOOST_CHECK_EQUAL(ordering.order.size(), 4);
+    BOOST_CHECK_EQUAL(ordering.rank.size(), 4);
+    BOOST_CHECK_EQUAL(ordering.contraction_to_original.size(), 4);
+    BOOST_CHECK_EQUAL(ordering.original_to_contraction.size(), 4);
+
+    for (const auto i : util::irange<std::size_t>(0, ordering.order.size()))
+    {
+        BOOST_CHECK_EQUAL(ordering.rank[ordering.order[i]], i);
+    }
+
+    for (const auto node : util::irange<NodeID>(0, 4))
+    {
+        const auto local = ordering.original_to_contraction[node];
+        BOOST_CHECK(local < 4);
+        BOOST_CHECK_EQUAL(ordering.contraction_to_original[local], node);
     }
 }
 
