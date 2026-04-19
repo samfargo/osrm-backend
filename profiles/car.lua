@@ -17,7 +17,7 @@ function setup()
     properties = {
       max_speed_for_map_matching      = 180/3.6, -- 180kmph -> m/s
       -- For routing based on duration, but weighted for preferring certain roads
-      weight_name                     = 'routability',
+      weight_name                     = 'duration',
       -- For shortest duration without penalties for accessibility
       -- weight_name                     = 'duration',
       -- For shortest distance without penalties for accessibility
