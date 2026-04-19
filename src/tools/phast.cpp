@@ -1,9 +1,15 @@
 #include "contractor/contracted_metric.hpp"
 #include "contractor/files.hpp"
+#include "engine/approach.hpp"
+#include "engine/datafacade/contiguous_internalmem_datafacade.hpp"
+#include "engine/datafacade/process_memory_allocator.hpp"
+#include "engine/hint.hpp"
 #include "extractor/files.hpp"
 #include "extractor/profile_properties.hpp"
+#include "osrm/coordinate.hpp"
 #include "osrm/exception.hpp"
 #include "storage/io_config.hpp"
+#include "storage/storage_config.hpp"
 #include "util/integer_range.hpp"
 #include "util/log.hpp"
 #include "util/meminfo.hpp"
@@ -17,9 +23,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -45,6 +53,9 @@ struct RuntimeConfig final
     std::vector<NodeID> seed_nodes;
     std::filesystem::path seed_file;
     bool has_seed_file = false;
+    std::filesystem::path poi_file;
+    bool has_poi_file = false;
+    std::string seed_metric = "weight";
     double cap_seconds = -1.;
     std::size_t debug_mismatch_limit = 0;
     std::size_t debug_arc_sample_limit = 8;
@@ -55,6 +66,27 @@ enum class return_code : unsigned
     ok,
     fail,
     exit
+};
+
+enum class SeedMetricKind : std::uint8_t
+{
+    Weight = 0,
+    Duration = 1
+};
+
+enum class SeedClass : std::uint8_t
+{
+    Bidirectional = 0,
+    ForwardOnly = 1,
+    ReverseOnly = 2,
+    Manual = 3
+};
+
+struct PHASTSeed
+{
+    NodeID node = SPECIAL_NODEID;
+    EdgeWeight cost = INVALID_EDGE_WEIGHT;
+    SeedClass seed_class = SeedClass::Bidirectional;
 };
 
 return_code
@@ -81,6 +113,13 @@ parseArguments(int argc,
         "seed-file",
         boost::program_options::value<std::filesystem::path>(&runtime_config.seed_file),
         "Path to a text file containing one seed node id per line")(
+        "poi-file",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.poi_file),
+        "Path to a text file containing one POI coordinate per line as 'lon,lat'")(
+        "seed-metric",
+        boost::program_options::value<std::string>(&runtime_config.seed_metric)
+            ->default_value("weight"),
+        "Seed offset metric: weight|duration")(
         "cap-seconds",
         boost::program_options::value<double>(&runtime_config.cap_seconds),
         "Optional traversal cap in seconds")(
@@ -156,14 +195,25 @@ parseArguments(int argc,
     {
         runtime_config.has_seed_file = true;
     }
-    if (runtime_config.seed_nodes.empty() && !runtime_config.has_seed_file)
+    if (option_variables.contains("poi-file"))
     {
-        util::Log(logERROR) << "Specify at least one seed using --seed-node or --seed-file.";
+        runtime_config.has_poi_file = true;
+    }
+    const bool has_manual_seeds = !runtime_config.seed_nodes.empty() || runtime_config.has_seed_file;
+    if (has_manual_seeds == runtime_config.has_poi_file)
+    {
+        util::Log(logERROR)
+            << "Provide exactly one seed source: --poi-file or --seed-node/--seed-file.";
         return return_code::fail;
     }
     if (option_variables.contains("cap-seconds") && runtime_config.cap_seconds < 0.)
     {
         util::Log(logERROR) << "--cap-seconds must be >= 0.";
+        return return_code::fail;
+    }
+    if (runtime_config.seed_metric != "weight" && runtime_config.seed_metric != "duration")
+    {
+        util::Log(logERROR) << "--seed-metric must be 'weight' or 'duration'.";
         return return_code::fail;
     }
     if (runtime_config.debug_mismatch_limit > 0 && runtime_config.debug_arc_sample_limit == 0)
@@ -642,7 +692,7 @@ bool relaxWithoutHeap(const NodeID source,
 }
 
 bool runUpwardSearch(const DerivedAdjacency &adjacency,
-                     const std::vector<NodeID> &seed_nodes,
+                     const std::vector<PHASTSeed> &seeds,
                      const std::optional<EdgeWeight> &cap_weight,
                      std::vector<EdgeWeight> &distances,
                      std::size_t &settled_nodes)
@@ -651,14 +701,24 @@ bool runUpwardSearch(const DerivedAdjacency &adjacency,
     distances.assign(node_count, INVALID_EDGE_WEIGHT);
     DistanceHeap heap(node_count);
 
-    for (const auto seed : seed_nodes)
+    for (const auto &seed : seeds)
     {
-        if (distances[seed] == EdgeWeight{0})
+        if (seed.node >= node_count)
+        {
+            util::Log(logERROR) << "Seed node id out of range: " << seed.node << " >= "
+                                << node_count;
+            return false;
+        }
+        if (seed.cost == INVALID_EDGE_WEIGHT || exceedsCap(seed.cost, cap_weight))
         {
             continue;
         }
-        distances[seed] = EdgeWeight{0};
-        heap.Insert(seed, EdgeWeight{0}, seed);
+        if (seed.cost >= distances[seed.node])
+        {
+            continue;
+        }
+        distances[seed.node] = seed.cost;
+        heap.Insert(seed.node, seed.cost, seed.node);
     }
 
     settled_nodes = 0;
@@ -713,7 +773,7 @@ bool runDownwardSweep(const contractor::PhastData &phast_data,
 }
 
 bool runReferenceDijkstra(const DerivedAdjacency &adjacency,
-                          const std::vector<NodeID> &seed_nodes,
+                          const std::vector<PHASTSeed> &seeds,
                           const std::optional<EdgeWeight> &cap_weight,
                           std::vector<EdgeWeight> &distances,
                           std::size_t &settled_nodes,
@@ -725,16 +785,26 @@ bool runReferenceDijkstra(const DerivedAdjacency &adjacency,
     trace.incoming_cost.assign(node_count, INVALID_EDGE_WEIGHT);
     DistanceHeap heap(node_count);
 
-    for (const auto seed : seed_nodes)
+    for (const auto &seed : seeds)
     {
-        if (distances[seed] == EdgeWeight{0})
+        if (seed.node >= node_count)
+        {
+            util::Log(logERROR) << "Seed node id out of range: " << seed.node << " >= "
+                                << node_count;
+            return false;
+        }
+        if (seed.cost == INVALID_EDGE_WEIGHT || exceedsCap(seed.cost, cap_weight))
         {
             continue;
         }
-        distances[seed] = EdgeWeight{0};
-        trace.predecessor[seed] = seed;
-        trace.incoming_cost[seed] = EdgeWeight{0};
-        heap.Insert(seed, EdgeWeight{0}, seed);
+        if (seed.cost >= distances[seed.node])
+        {
+            continue;
+        }
+        distances[seed.node] = seed.cost;
+        trace.predecessor[seed.node] = seed.node;
+        trace.incoming_cost[seed.node] = EdgeWeight{0};
+        heap.Insert(seed.node, seed.cost, seed.node);
     }
 
     settled_nodes = 0;
@@ -765,12 +835,55 @@ bool runReferenceDijkstra(const DerivedAdjacency &adjacency,
     return true;
 }
 
-bool loadSeedFile(const std::filesystem::path &seed_file, std::vector<NodeID> &seed_nodes)
+using CHDataFacade =
+    engine::datafacade::ContiguousInternalMemoryDataFacade<engine::routing_algorithms::ch::Algorithm>;
+
+const char *seedClassToString(const SeedClass seed_class)
+{
+    switch (seed_class)
+    {
+    case SeedClass::Bidirectional:
+        return "bidirectional";
+    case SeedClass::ForwardOnly:
+        return "forward_only";
+    case SeedClass::ReverseOnly:
+        return "reverse_only";
+    case SeedClass::Manual:
+        return "manual";
+    }
+    return "unknown";
+}
+
+bool parseSeedMetricKind(const RuntimeConfig &runtime_config,
+                         const std::string &weight_name,
+                         SeedMetricKind &seed_metric_kind)
+{
+    if (runtime_config.seed_metric == "weight")
+    {
+        seed_metric_kind = SeedMetricKind::Weight;
+        return true;
+    }
+    if (runtime_config.seed_metric == "duration")
+    {
+        if (weight_name != "duration")
+        {
+            util::Log(logERROR) << "--seed-metric=duration requires a duration-weighted dataset.";
+            return false;
+        }
+        seed_metric_kind = SeedMetricKind::Duration;
+        return true;
+    }
+
+    util::Log(logERROR) << "Unknown seed metric: " << runtime_config.seed_metric;
+    return false;
+}
+
+bool loadManualSeedFile(const std::filesystem::path &seed_file, std::vector<NodeID> &seed_nodes)
 {
     std::ifstream input(seed_file);
     if (!input)
     {
-        util::Log(logERROR) << "Could not open seed file: " << seed_file.string();
+        util::Log(logERROR) << "Could not open manual seed file: " << seed_file.string();
         return false;
     }
 
@@ -791,7 +904,8 @@ bool loadSeedFile(const std::filesystem::path &seed_file, std::vector<NodeID> &s
         std::uint64_t node_id = 0;
         if (!(parser >> node_id))
         {
-            util::Log(logERROR) << "Invalid seed value in " << seed_file.string() << ":" << line_number;
+            util::Log(logERROR) << "Invalid seed value in " << seed_file.string() << ":"
+                                << line_number;
             return false;
         }
         parser >> std::ws;
@@ -813,36 +927,470 @@ bool loadSeedFile(const std::filesystem::path &seed_file, std::vector<NodeID> &s
     return true;
 }
 
-bool prepareSeedNodes(const RuntimeConfig &runtime_config,
-                      const std::uint32_t node_count,
-                      std::vector<NodeID> &seed_nodes)
+bool prepareManualSeeds(const RuntimeConfig &runtime_config,
+                        const std::uint32_t node_count,
+                        std::vector<PHASTSeed> &seeds)
 {
-    seed_nodes = runtime_config.seed_nodes;
-    if (runtime_config.has_seed_file && !loadSeedFile(runtime_config.seed_file, seed_nodes))
+    std::vector<NodeID> manual_seed_nodes = runtime_config.seed_nodes;
+    if (runtime_config.has_seed_file &&
+        !loadManualSeedFile(runtime_config.seed_file, manual_seed_nodes))
     {
         return false;
     }
-    if (seed_nodes.empty())
+    if (manual_seed_nodes.empty())
     {
-        util::Log(logERROR) << "No seed nodes loaded.";
+        util::Log(logERROR) << "No manual seed nodes loaded.";
         return false;
     }
 
-    std::sort(seed_nodes.begin(), seed_nodes.end());
-    seed_nodes.erase(std::unique(seed_nodes.begin(), seed_nodes.end()), seed_nodes.end());
+    std::sort(manual_seed_nodes.begin(), manual_seed_nodes.end());
+    manual_seed_nodes.erase(std::unique(manual_seed_nodes.begin(), manual_seed_nodes.end()),
+                            manual_seed_nodes.end());
 
-    for (const auto seed : seed_nodes)
+    seeds.clear();
+    seeds.reserve(manual_seed_nodes.size());
+    for (const auto seed_node : manual_seed_nodes)
     {
-        if (seed >= node_count)
+        if (seed_node >= node_count)
         {
-            util::Log(logERROR) << "Seed node id out of range: " << seed << " >= " << node_count;
+            util::Log(logERROR) << "Manual seed node id out of range: " << seed_node << " >= "
+                                << node_count;
+            return false;
+        }
+        seeds.push_back({seed_node, EdgeWeight{0}, SeedClass::Manual});
+    }
+    return true;
+}
+
+struct POIRecord
+{
+    util::Coordinate coordinate;
+    std::uint64_t line_number = 0;
+};
+
+struct SeedBuildStats
+{
+    std::size_t poi_count = 0;
+    std::size_t cache_hits = 0;
+    std::size_t big_component_fallbacks = 0;
+    std::size_t bidirectional_count = 0;
+    std::size_t forward_only_count = 0;
+    std::size_t reverse_only_count = 0;
+    std::size_t directional_state_count = 0;
+    std::size_t dedup_dropped_count = 0;
+};
+
+bool parsePOILine(const std::string &line,
+                  const std::filesystem::path &poi_file,
+                  const std::uint64_t line_number,
+                  std::optional<POIRecord> &record)
+{
+    std::string token = line;
+    const auto comment_pos = token.find('#');
+    if (comment_pos != std::string::npos)
+    {
+        token.erase(comment_pos);
+    }
+
+    const auto first = token.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        record = std::nullopt;
+        return true;
+    }
+
+    const auto last = token.find_last_not_of(" \t\r\n");
+    token = token.substr(first, last - first + 1);
+    std::replace(token.begin(), token.end(), ',', ' ');
+
+    std::istringstream parser(token);
+    double lon = 0.;
+    double lat = 0.;
+    if (!(parser >> lon >> lat))
+    {
+        util::Log(logERROR) << "Invalid POI coordinate in " << poi_file.string() << ":"
+                            << line_number;
+        return false;
+    }
+    parser >> std::ws;
+    if (!parser.eof())
+    {
+        util::Log(logERROR) << "Unexpected trailing token in " << poi_file.string() << ":"
+                            << line_number;
+        return false;
+    }
+    if (!std::isfinite(lon) || !std::isfinite(lat))
+    {
+        util::Log(logERROR) << "Non-finite POI coordinate in " << poi_file.string() << ":"
+                            << line_number;
+        return false;
+    }
+
+    util::Coordinate coordinate;
+    try
+    {
+        coordinate = util::Coordinate{
+            util::UnsafeFloatLongitude{lon},
+            util::UnsafeFloatLatitude{lat},
+        };
+    }
+    catch (const std::exception &)
+    {
+        util::Log(logERROR) << "POI coordinate out of range in " << poi_file.string() << ":"
+                            << line_number;
+        return false;
+    }
+
+    if (!coordinate.IsValid())
+    {
+        util::Log(logERROR) << "POI coordinate invalid in " << poi_file.string() << ":"
+                            << line_number;
+        return false;
+    }
+
+    record = POIRecord{coordinate, line_number};
+    return true;
+}
+
+bool loadPOIFile(const std::filesystem::path &poi_file, std::vector<POIRecord> &pois)
+{
+    std::ifstream input(poi_file);
+    if (!input)
+    {
+        util::Log(logERROR) << "Could not open POI file: " << poi_file.string();
+        return false;
+    }
+
+    pois.clear();
+    std::string line;
+    std::uint64_t line_number = 0;
+    while (std::getline(input, line))
+    {
+        ++line_number;
+        std::optional<POIRecord> record;
+        if (!parsePOILine(line, poi_file, line_number, record))
+        {
+            return false;
+        }
+        if (record)
+        {
+            pois.push_back(record.value());
+        }
+    }
+
+    if (pois.empty())
+    {
+        util::Log(logERROR) << "POI file did not contain any coordinates: " << poi_file.string();
+        return false;
+    }
+
+    return true;
+}
+
+bool convertSeedCost(const engine::PhantomNode &phantom,
+                     const bool forward_state,
+                     const SeedMetricKind seed_metric_kind,
+                     EdgeWeight &seed_cost)
+{
+    if (seed_metric_kind == SeedMetricKind::Duration)
+    {
+        const auto duration =
+            forward_state ? phantom.GetForwardDuration() : phantom.GetReverseDuration();
+        if (duration == MAXIMAL_EDGE_DURATION)
+        {
+            return false;
+        }
+        const auto duration_value = from_alias<std::int64_t>(duration);
+        const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+        if (duration_value < 0 || duration_value > max_valid)
+        {
+            return false;
+        }
+        seed_cost = to_alias<EdgeWeight>(duration_value);
+        return true;
+    }
+
+    seed_cost =
+        forward_state ? phantom.GetForwardWeightPlusOffset() : phantom.GetReverseWeightPlusOffset();
+    return seed_cost != INVALID_EDGE_WEIGHT && seed_cost >= EdgeWeight{0};
+}
+
+struct CoordinateKey
+{
+    std::int32_t lon;
+    std::int32_t lat;
+
+    bool operator==(const CoordinateKey &) const = default;
+};
+
+struct CoordinateKeyHash
+{
+    std::size_t operator()(const CoordinateKey &key) const
+    {
+        const auto lon = static_cast<std::uint32_t>(key.lon);
+        const auto lat = static_cast<std::uint32_t>(key.lat);
+        return (static_cast<std::uint64_t>(lon) << 32) | lat;
+    }
+};
+
+SeedClass classifyTargetSeed(const bool forward_valid, const bool reverse_valid)
+{
+    if (forward_valid && reverse_valid)
+    {
+        return SeedClass::Bidirectional;
+    }
+    if (forward_valid)
+    {
+        return SeedClass::ForwardOnly;
+    }
+    return SeedClass::ReverseOnly;
+}
+
+bool buildPOISeeds(const RuntimeConfig &runtime_config,
+                   const std::uint32_t node_count,
+                   const SeedMetricKind seed_metric_kind,
+                   const CHDataFacade &facade,
+                   std::vector<PHASTSeed> &seeds,
+                   SeedBuildStats &stats)
+{
+    std::vector<POIRecord> pois;
+    if (!loadPOIFile(runtime_config.poi_file, pois))
+    {
+        return false;
+    }
+    stats.poi_count = pois.size();
+
+    std::unordered_map<CoordinateKey, engine::SegmentHint, CoordinateKeyHash> snap_cache;
+    std::vector<EdgeWeight> minimum_seed_cost(node_count, INVALID_EDGE_WEIGHT);
+    std::vector<SeedClass> minimum_seed_class(node_count, SeedClass::Bidirectional);
+
+    for (const auto &poi : pois)
+    {
+        const auto key = CoordinateKey{
+            static_cast<std::int32_t>(poi.coordinate.lon),
+            static_cast<std::int32_t>(poi.coordinate.lat),
+        };
+
+        engine::PhantomNode snapped_phantom;
+        auto cache_iterator = snap_cache.find(key);
+        if (cache_iterator != snap_cache.end() &&
+            cache_iterator->second.IsValid(poi.coordinate, facade))
+        {
+            snapped_phantom = cache_iterator->second.phantom;
+            ++stats.cache_hits;
+        }
+        else
+        {
+            auto alternatives = facade.NearestCandidatesWithAlternativeFromBigComponent(
+                poi.coordinate, std::nullopt, std::nullopt, engine::Approach::UNRESTRICTED, true);
+            if (!alternatives.first.empty())
+            {
+                snapped_phantom = alternatives.first.front();
+            }
+            else if (!alternatives.second.empty())
+            {
+                snapped_phantom = alternatives.second.front();
+                ++stats.big_component_fallbacks;
+            }
+            else
+            {
+                util::Log(logERROR) << "No phantom candidate found for POI at line "
+                                    << poi.line_number;
+                return false;
+            }
+
+            snap_cache[key] = engine::SegmentHint{snapped_phantom, facade.GetCheckSum()};
+        }
+
+        if (!snapped_phantom.IsValid(node_count, poi.coordinate))
+        {
+            util::Log(logERROR) << "Invalid snapped phantom for POI at line " << poi.line_number;
+            return false;
+        }
+
+        const auto forward_valid = snapped_phantom.IsValidForwardTarget();
+        const auto reverse_valid = snapped_phantom.IsValidReverseTarget();
+        if (!forward_valid && !reverse_valid)
+        {
+            util::Log(logERROR) << "Snapped phantom has no valid target states for POI line "
+                                << poi.line_number;
+            return false;
+        }
+
+        const auto seed_class = classifyTargetSeed(forward_valid, reverse_valid);
+        switch (seed_class)
+        {
+        case SeedClass::Bidirectional:
+            ++stats.bidirectional_count;
+            break;
+        case SeedClass::ForwardOnly:
+            ++stats.forward_only_count;
+            break;
+        case SeedClass::ReverseOnly:
+            ++stats.reverse_only_count;
+            break;
+        case SeedClass::Manual:
+            break;
+        }
+
+        const auto push_seed = [&](const NodeID node, const EdgeWeight cost)
+        {
+            if (node >= node_count)
+            {
+                util::Log(logERROR) << "Snapped seed node out of range: " << node << " >= "
+                                    << node_count;
+                return false;
+            }
+            if (cost == INVALID_EDGE_WEIGHT || cost < EdgeWeight{0})
+            {
+                util::Log(logERROR) << "Invalid snapped seed cost for node " << node;
+                return false;
+            }
+
+            auto &minimum = minimum_seed_cost[node];
+            if (minimum == INVALID_EDGE_WEIGHT || cost < minimum)
+            {
+                if (minimum != INVALID_EDGE_WEIGHT)
+                {
+                    ++stats.dedup_dropped_count;
+                }
+                minimum = cost;
+                minimum_seed_class[node] = seed_class;
+            }
+            else
+            {
+                ++stats.dedup_dropped_count;
+            }
+            ++stats.directional_state_count;
+            return true;
+        };
+
+        if (forward_valid)
+        {
+            EdgeWeight forward_cost = INVALID_EDGE_WEIGHT;
+            if (!convertSeedCost(snapped_phantom, true, seed_metric_kind, forward_cost))
+            {
+                util::Log(logERROR) << "Could not convert forward seed offset for POI line "
+                                    << poi.line_number;
+                return false;
+            }
+            if (!push_seed(snapped_phantom.forward_segment_id.id, forward_cost))
+            {
+                return false;
+            }
+        }
+        if (reverse_valid)
+        {
+            EdgeWeight reverse_cost = INVALID_EDGE_WEIGHT;
+            if (!convertSeedCost(snapped_phantom, false, seed_metric_kind, reverse_cost))
+            {
+                util::Log(logERROR) << "Could not convert reverse seed offset for POI line "
+                                    << poi.line_number;
+                return false;
+            }
+            if (!push_seed(snapped_phantom.reverse_segment_id.id, reverse_cost))
+            {
+                return false;
+            }
+        }
+    }
+
+    seeds.clear();
+    for (const auto node : util::irange<NodeID>(0, node_count))
+    {
+        if (minimum_seed_cost[node] == INVALID_EDGE_WEIGHT)
+        {
+            continue;
+        }
+        seeds.push_back({node, minimum_seed_cost[node], minimum_seed_class[node]});
+    }
+
+    if (seeds.empty())
+    {
+        util::Log(logERROR) << "No usable PHAST seeds were generated from POIs.";
+        return false;
+    }
+
+    return true;
+}
+
+bool validateSeeds(const std::uint32_t node_count, const std::vector<PHASTSeed> &seeds)
+{
+    if (seeds.empty())
+    {
+        util::Log(logERROR) << "No PHAST seeds available.";
+        return false;
+    }
+
+    for (const auto &seed : seeds)
+    {
+        if (seed.node >= node_count)
+        {
+            util::Log(logERROR) << "Seed node out of range: " << seed.node << " >= " << node_count;
+            return false;
+        }
+        if (seed.cost == INVALID_EDGE_WEIGHT || seed.cost < EdgeWeight{0})
+        {
+            util::Log(logERROR) << "Seed cost invalid for node " << seed.node;
             return false;
         }
     }
     return true;
 }
 
-bool parseCapWeight(const RuntimeConfig &runtime_config, std::optional<EdgeWeight> &cap_weight)
+bool loadCHFacade(const std::filesystem::path &base_path,
+                  const std::string &metric_name,
+                  const std::size_t exclude_index,
+                  std::shared_ptr<const CHDataFacade> &facade)
+{
+    const storage::StorageConfig storage_config(base_path);
+    if (!storage_config.IsValid())
+    {
+        util::Log(logERROR) << "Dataset files required for snapping are missing.";
+        return false;
+    }
+
+    try
+    {
+        auto allocator =
+            std::make_shared<engine::datafacade::ProcessMemoryAllocator>(storage_config);
+        facade = std::make_shared<const CHDataFacade>(allocator, metric_name, exclude_index);
+    }
+    catch (const std::exception &e)
+    {
+        util::Log(logERROR) << "Failed to initialize CH facade for snapping: " << e.what();
+        return false;
+    }
+
+    return true;
+}
+
+bool validateFacadeMetadata(const CHDataFacade &facade,
+                            const contractor::PhastData &phast_data,
+                            const std::string &metric_name)
+{
+    if (facade.GetCheckSum() != phast_data.connectivity_checksum)
+    {
+        util::Log(logWARNING) << "Facade checksum (" << facade.GetCheckSum()
+                              << ") differs from PHAST connectivity checksum ("
+                              << phast_data.connectivity_checksum << ").";
+    }
+    if (std::string{facade.GetWeightName()} != metric_name)
+    {
+        util::Log(logERROR) << "Weight name mismatch between facade and .osrm.properties";
+        return false;
+    }
+    if (facade.GetNumberOfNodes() != phast_data.node_count)
+    {
+        util::Log(logERROR) << "Node count mismatch between facade and .osrm.phast";
+        return false;
+    }
+    return true;
+}
+
+bool parseCapWeight(const RuntimeConfig &runtime_config,
+                    const extractor::ProfileProperties &properties,
+                    std::optional<EdgeWeight> &cap_weight)
 {
     cap_weight = std::nullopt;
     if (runtime_config.cap_seconds < 0.)
@@ -855,7 +1403,14 @@ bool parseCapWeight(const RuntimeConfig &runtime_config, std::optional<EdgeWeigh
         return false;
     }
 
-    const auto cap_ticks = static_cast<std::int64_t>(std::ceil(runtime_config.cap_seconds * 10.));
+    if (properties.GetWeightName() != "duration")
+    {
+        util::Log(logERROR) << "--cap-seconds requires weight_name=duration.";
+        return false;
+    }
+
+    const auto cap_ticks = static_cast<std::int64_t>(
+        std::ceil(runtime_config.cap_seconds * properties.GetWeightMultiplier()));
     const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
     if (cap_ticks < 0 || cap_ticks > max_valid)
     {
@@ -946,6 +1501,28 @@ void printArrayPreview(const char *label, const std::vector<NodeID> &values)
     }
     if (values.size() > preview)
         out << ", ...";
+    out << "]";
+    util::Log() << out.str();
+}
+
+void printSeedPreview(const std::vector<PHASTSeed> &seeds)
+{
+    std::ostringstream out;
+    out << "Seed preview [";
+    const auto preview = std::min<std::size_t>(seeds.size(), 5);
+    for (const auto i : util::irange<std::size_t>(0, preview))
+    {
+        if (i > 0)
+        {
+            out << ", ";
+        }
+        out << "{node=" << seeds[i].node << ", cost=" << seeds[i].cost
+            << ", class=" << seedClassToString(seeds[i].seed_class) << "}";
+    }
+    if (seeds.size() > preview)
+    {
+        out << ", ...";
+    }
     out << "]";
     util::Log() << out.str();
 }
@@ -1267,6 +1844,16 @@ try
         return EXIT_FAILURE;
     }
 
+    std::shared_ptr<const CHDataFacade> facade;
+    if (!loadCHFacade(phast_config.base_path, metric_name, phast_data.exclude_index, facade))
+    {
+        return EXIT_FAILURE;
+    }
+    if (!validateFacadeMetadata(*facade, phast_data, metric_name))
+    {
+        return EXIT_FAILURE;
+    }
+
     const auto &selected_edge_filter = metric.edge_filter[phast_data.exclude_index];
     DerivedAdjacency adjacency;
     if (!deriveAdjacency(graph, selected_edge_filter, phast_data, adjacency))
@@ -1285,20 +1872,56 @@ try
         logDerivedArcSamples(phast_data, adjacency, runtime_config.debug_arc_sample_limit);
     }
 
-    std::vector<NodeID> seed_nodes;
-    if (!prepareSeedNodes(runtime_config, phast_data.node_count, seed_nodes))
+    SeedMetricKind seed_metric_kind = SeedMetricKind::Weight;
+    if (!parseSeedMetricKind(runtime_config, metric_name, seed_metric_kind))
     {
         return EXIT_FAILURE;
     }
-    printArrayPreview("Seed node preview", seed_nodes);
-    util::Log() << "Seed node count: " << seed_nodes.size();
-    if (runtime_config.has_seed_file)
+    util::Log() << "Seed metric: "
+                << (seed_metric_kind == SeedMetricKind::Weight ? "weight" : "duration");
+
+    std::vector<PHASTSeed> seeds;
+    SeedBuildStats seed_stats;
+    if (runtime_config.has_poi_file)
     {
-        util::Log() << "Seed file: " << runtime_config.seed_file.string();
+        if (!buildPOISeeds(
+                runtime_config, phast_data.node_count, seed_metric_kind, *facade, seeds, seed_stats))
+        {
+            return EXIT_FAILURE;
+        }
+        util::Log() << "POI file: " << runtime_config.poi_file.string();
+        util::Log() << "POIs parsed: " << seed_stats.poi_count;
+        util::Log() << "Snap cache hits: " << seed_stats.cache_hits;
+        util::Log() << "Big-component snap fallbacks: " << seed_stats.big_component_fallbacks;
+        util::Log() << "Seed classes: bidirectional=" << seed_stats.bidirectional_count
+                    << " forward_only=" << seed_stats.forward_only_count
+                    << " reverse_only=" << seed_stats.reverse_only_count;
+        util::Log() << "Directional state seeds before dedup: " << seed_stats.directional_state_count;
+        util::Log() << "Directional state seeds dropped by dedup: "
+                    << seed_stats.dedup_dropped_count;
+    }
+    else
+    {
+        if (!prepareManualSeeds(runtime_config, phast_data.node_count, seeds))
+        {
+            return EXIT_FAILURE;
+        }
+        if (runtime_config.has_seed_file)
+        {
+            util::Log() << "Manual seed file: " << runtime_config.seed_file.string();
+        }
+        util::Log() << "Manual seeds loaded (cost 0).";
     }
 
+    if (!validateSeeds(phast_data.node_count, seeds))
+    {
+        return EXIT_FAILURE;
+    }
+    printSeedPreview(seeds);
+    util::Log() << "Seed count after dedup: " << seeds.size();
+
     std::optional<EdgeWeight> cap_weight;
-    if (!parseCapWeight(runtime_config, cap_weight))
+    if (!parseCapWeight(runtime_config, properties, cap_weight))
     {
         return EXIT_FAILURE;
     }
@@ -1316,7 +1939,7 @@ try
     std::size_t upward_settled_nodes = 0;
     std::size_t downward_updates = 0;
     const auto phast_start = std::chrono::steady_clock::now();
-    if (!runUpwardSearch(adjacency, seed_nodes, cap_weight, phast_distances, upward_settled_nodes))
+    if (!runUpwardSearch(adjacency, seeds, cap_weight, phast_distances, upward_settled_nodes))
     {
         return EXIT_FAILURE;
     }
@@ -1334,7 +1957,7 @@ try
     std::size_t dijkstra_settled_nodes = 0;
     const auto reference_start = std::chrono::steady_clock::now();
     if (!runReferenceDijkstra(adjacency,
-                              seed_nodes,
+                              seeds,
                               cap_weight,
                               reference_distances,
                               dijkstra_settled_nodes,
