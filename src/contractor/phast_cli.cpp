@@ -63,17 +63,7 @@ ReturnCode ParseArguments(int argc,
         "Output format: phastfield-v1|raw-u32")(
         "output",
         boost::program_options::value<std::filesystem::path>(&runtime_config.output_path),
-        "Output path (default: <input>.phastfield or <input>.phastfield.raw_u32)")(
-        "oracle-node-file",
-        boost::program_options::value<std::filesystem::path>(&runtime_config.oracle_node_file),
-        "Optional text file of CH source node IDs (one per line) for node-state oracle checks")(
-        "oracle-tolerance",
-        boost::program_options::value<std::uint64_t>(&runtime_config.oracle_tolerance)->default_value(
-            0),
-        "Max allowed absolute oracle delta in ticks")(
-        "oracle-report",
-        boost::program_options::value<std::filesystem::path>(&runtime_config.oracle_report_path),
-        "Optional CSV report path for node-state oracle results");
+        "Output path (default: <input>.phastfield or <input>.phastfield.raw_u32)");
 
     boost::program_options::options_description hidden_options("Hidden options");
     hidden_options.add_options()(
@@ -170,14 +160,6 @@ ReturnCode ParseArguments(int argc,
     {
         runtime_config.has_output_path = true;
     }
-    if (option_variables.contains("oracle-node-file"))
-    {
-        runtime_config.has_oracle_node_file = true;
-    }
-    if (option_variables.contains("oracle-report"))
-    {
-        runtime_config.has_oracle_report_path = true;
-    }
 
     const bool has_manual_seeds = !runtime_config.seed_nodes.empty() || runtime_config.has_seed_file;
     if (has_manual_seeds == runtime_config.has_poi_file)
@@ -219,11 +201,6 @@ ReturnCode ParseArguments(int argc,
             util::Log(logERROR) << "--orientation must be 'forward' or 'reverse'.";
             return ReturnCode::Fail;
         }
-    }
-    if (!runtime_config.has_oracle_node_file && runtime_config.has_oracle_report_path)
-    {
-        util::Log(logERROR) << "--oracle-report requires --oracle-node-file.";
-        return ReturnCode::Fail;
     }
 
     return ReturnCode::Ok;

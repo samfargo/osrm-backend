@@ -9,9 +9,6 @@
 #include "extractor/files.hpp"
 #include "extractor/profile_properties.hpp"
 
-#include "engine/routing_algorithms/routing_base_ch.hpp"
-#include "engine/search_engine_data.hpp"
-
 #include "osrm/exception.hpp"
 
 #include "util/exception.hpp"
@@ -19,225 +16,15 @@
 #include "util/meminfo.hpp"
 
 #include <chrono>
-#include <cmath>
 #include <cstdlib>
 #include <exception>
-#include <fstream>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 using namespace osrm;
-
-namespace
-{
-
-struct NodeOracleStats
-{
-    std::size_t sample_count = 0;
-    std::size_t both_reachable_count = 0;
-    std::size_t both_unreachable_count = 0;
-    std::size_t reachability_mismatch_count = 0;
-    std::size_t value_mismatch_count = 0;
-    std::int64_t max_abs_delta_ticks = 0;
-};
-
-bool LoadOracleNodeFile(const std::filesystem::path &path,
-                        const std::uint32_t node_count,
-                        std::vector<NodeID> &nodes)
-{
-    std::ifstream input(path);
-    if (!input)
-    {
-        util::Log(logERROR) << "Could not open oracle node file: " << path.string();
-        return false;
-    }
-
-    nodes.clear();
-    std::string line;
-    std::uint64_t line_number = 0;
-    while (std::getline(input, line))
-    {
-        ++line_number;
-        const auto first = line.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos || line[first] == '#')
-        {
-            continue;
-        }
-        const auto last = line.find_last_not_of(" \t\r\n");
-        const auto token = line.substr(first, last - first + 1);
-
-        std::istringstream parser(token);
-        std::uint64_t source_node = 0;
-        if (!(parser >> source_node))
-        {
-            util::Log(logERROR) << "Invalid oracle node value in " << path.string() << ":" << line_number;
-            return false;
-        }
-        parser >> std::ws;
-        if (!parser.eof())
-        {
-            util::Log(logERROR) << "Unexpected trailing data in " << path.string() << ":" << line_number;
-            return false;
-        }
-        if (source_node >= node_count)
-        {
-            util::Log(logERROR) << "Oracle node id out of range in " << path.string() << ":"
-                                << line_number;
-            return false;
-        }
-        nodes.push_back(static_cast<NodeID>(source_node));
-    }
-
-    if (nodes.empty())
-    {
-        util::Log(logERROR) << "Oracle node file did not contain any node IDs: " << path.string();
-        return false;
-    }
-
-    return true;
-}
-
-void InsertOrDecreaseReverseSeed(engine::SearchEngineData<engine::routing_algorithms::ch::Algorithm>::QueryHeap
-                                     &reverse_heap,
-                                 const contractor::phast::PHASTSeed &seed)
-{
-    const auto heap_node = reverse_heap.GetHeapNodeIfWasInserted(seed.node);
-    if (!heap_node)
-    {
-        reverse_heap.Insert(seed.node, seed.cost, seed.node);
-        return;
-    }
-    if (seed.cost >= heap_node->weight)
-    {
-        return;
-    }
-    heap_node->weight = seed.cost;
-    heap_node->data.parent = seed.node;
-    reverse_heap.DecreaseKey(*heap_node);
-}
-
-std::string WeightToString(const EdgeWeight weight)
-{
-    if (weight == INVALID_EDGE_WEIGHT)
-    {
-        return "INF";
-    }
-    return std::to_string(from_alias<std::int64_t>(weight));
-}
-
-bool RunNodeOracle(const contractor::phast::RuntimeConfig &runtime_config,
-                   const contractor::phast::CHDataFacade &facade,
-                   const std::vector<contractor::phast::PHASTSeed> &seeds,
-                   const std::vector<EdgeWeight> &phast_distances,
-                   NodeOracleStats &stats)
-{
-    std::vector<NodeID> source_nodes;
-    if (!LoadOracleNodeFile(runtime_config.oracle_node_file, facade.GetNumberOfNodes(), source_nodes))
-    {
-        return false;
-    }
-
-    std::ofstream report;
-    if (runtime_config.has_oracle_report_path)
-    {
-        report.open(runtime_config.oracle_report_path);
-        if (!report)
-        {
-            util::Log(logERROR) << "Could not open oracle report for writing: "
-                                << runtime_config.oracle_report_path.string();
-            return false;
-        }
-        report << "source_node_id,phast_ticks,oracle_ticks,delta_ticks,status\n";
-    }
-
-    engine::SearchEngineData<engine::routing_algorithms::ch::Algorithm> search_data;
-    search_data.InitializeOrClearFirstThreadLocalStorage(facade.GetNumberOfNodes());
-    auto &forward_heap = *search_data.forward_heap_1;
-    auto &reverse_heap = *search_data.reverse_heap_1;
-
-    std::vector<NodeID> packed_leg;
-    packed_leg.reserve(32);
-
-    stats = {};
-    const auto tolerance_ticks = static_cast<std::int64_t>(runtime_config.oracle_tolerance);
-    for (const auto source_node : source_nodes)
-    {
-        ++stats.sample_count;
-        forward_heap.Clear();
-        reverse_heap.Clear();
-        packed_leg.clear();
-
-        forward_heap.Insert(source_node, EdgeWeight{0}, source_node);
-        for (const auto &seed : seeds)
-        {
-            InsertOrDecreaseReverseSeed(reverse_heap, seed);
-        }
-
-        EdgeWeight oracle_weight = INVALID_EDGE_WEIGHT;
-        engine::routing_algorithms::ch::search(search_data,
-                                               facade,
-                                               forward_heap,
-                                               reverse_heap,
-                                               oracle_weight,
-                                               packed_leg,
-                                               {});
-
-        const auto phast_weight = phast_distances[source_node];
-        const bool phast_reachable = phast_weight != INVALID_EDGE_WEIGHT;
-        const bool oracle_reachable = oracle_weight != INVALID_EDGE_WEIGHT;
-
-        if (!phast_reachable && !oracle_reachable)
-        {
-            ++stats.both_unreachable_count;
-            if (report)
-            {
-                report << source_node << ",INF,INF,,match\n";
-            }
-            continue;
-        }
-
-        if (phast_reachable != oracle_reachable)
-        {
-            ++stats.reachability_mismatch_count;
-            if (report)
-            {
-                report << source_node << "," << WeightToString(phast_weight) << ","
-                       << WeightToString(oracle_weight) << ",,reachability_mismatch\n";
-            }
-            continue;
-        }
-
-        ++stats.both_reachable_count;
-        const auto phast_ticks = from_alias<std::int64_t>(phast_weight);
-        const auto oracle_ticks = from_alias<std::int64_t>(oracle_weight);
-        const auto delta_ticks = phast_ticks - oracle_ticks;
-        const auto abs_delta_ticks = std::abs(delta_ticks);
-        if (abs_delta_ticks > stats.max_abs_delta_ticks)
-        {
-            stats.max_abs_delta_ticks = abs_delta_ticks;
-        }
-
-        const bool within_tolerance = abs_delta_ticks <= tolerance_ticks;
-        if (!within_tolerance)
-        {
-            ++stats.value_mismatch_count;
-        }
-
-        if (report)
-        {
-            report << source_node << "," << phast_ticks << "," << oracle_ticks << "," << delta_ticks
-                   << "," << (within_tolerance ? "match" : "value_mismatch") << "\n";
-        }
-    }
-
-    return true;
-}
-
-} // namespace
 
 int main(int argc, char *argv[])
 try
@@ -446,36 +233,6 @@ try
 
     util::Log() << "Output format: " << runtime_config.output_format;
     util::Log() << "Wrote PHAST field output: " << output_path.string();
-
-    if (runtime_config.has_oracle_node_file)
-    {
-        NodeOracleStats oracle_stats;
-        if (!RunNodeOracle(runtime_config, *facade, seeds, phast_distances, oracle_stats))
-        {
-            return EXIT_FAILURE;
-        }
-
-        util::Log() << "Node-state oracle samples: " << oracle_stats.sample_count;
-        util::Log() << "Node-state oracle both reachable: " << oracle_stats.both_reachable_count;
-        util::Log() << "Node-state oracle both unreachable: " << oracle_stats.both_unreachable_count;
-        util::Log() << "Node-state oracle reachability mismatches: "
-                    << oracle_stats.reachability_mismatch_count;
-        util::Log() << "Node-state oracle value mismatches (> " << runtime_config.oracle_tolerance
-                    << " ticks): " << oracle_stats.value_mismatch_count;
-        util::Log() << "Node-state oracle max abs delta: " << oracle_stats.max_abs_delta_ticks
-                    << " ticks";
-        if (runtime_config.has_oracle_report_path)
-        {
-            util::Log() << "Wrote node-state oracle report: "
-                        << runtime_config.oracle_report_path.string();
-        }
-
-        if (oracle_stats.reachability_mismatch_count > 0 || oracle_stats.value_mismatch_count > 0)
-        {
-            util::Log(logERROR) << "Node-state oracle validation failed.";
-            return EXIT_FAILURE;
-        }
-    }
 
     util::DumpMemoryStats();
     return EXIT_SUCCESS;

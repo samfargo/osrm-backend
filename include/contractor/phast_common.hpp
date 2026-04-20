@@ -43,11 +43,6 @@ struct RuntimeConfig final
     std::string output_format = "phastfield-v1";
     std::filesystem::path output_path;
     bool has_output_path = false;
-    std::filesystem::path oracle_node_file;
-    bool has_oracle_node_file = false;
-    std::filesystem::path oracle_report_path;
-    bool has_oracle_report_path = false;
-    std::uint64_t oracle_tolerance = 0;
 };
 
 enum class ReturnCode : unsigned
