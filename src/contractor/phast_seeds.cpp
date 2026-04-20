@@ -327,7 +327,25 @@ bool BuildPOISeeds(const RuntimeConfig &runtime_config,
                 poi.coordinate, std::nullopt, std::nullopt, engine::Approach::UNRESTRICTED, true);
             if (!alternatives.first.empty())
             {
-                snapped_phantom = alternatives.first.front();
+                const auto first_non_tiny = std::find_if(
+                    alternatives.first.begin(),
+                    alternatives.first.end(),
+                    [](const engine::PhantomNode &candidate) {
+                        return !candidate.component.is_tiny;
+                    });
+                if (first_non_tiny != alternatives.first.end())
+                {
+                    snapped_phantom = *first_non_tiny;
+                }
+                else if (!alternatives.second.empty())
+                {
+                    snapped_phantom = alternatives.second.front();
+                    ++stats.big_component_fallbacks;
+                }
+                else
+                {
+                    snapped_phantom = alternatives.first.front();
+                }
             }
             else if (!alternatives.second.empty())
             {

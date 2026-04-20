@@ -507,11 +507,28 @@ bool mapSampleToCost(const CHDataFacade &facade,
                      RasterizationStats &stats)
 {
     mapped_cost = INVALID_EDGE_WEIGHT;
-    auto candidates = facade.NearestPhantomNodes(sample.coordinate,
-                                                 MAX_SNAP_CANDIDATES,
-                                                 std::nullopt,
-                                                 std::nullopt,
-                                                 engine::Approach::UNRESTRICTED);
+
+    std::vector<engine::PhantomNode> candidates;
+    const auto nearest_candidates = facade.NearestPhantomNodes(sample.coordinate,
+                                                               MAX_SNAP_CANDIDATES,
+                                                               std::nullopt,
+                                                               std::nullopt,
+                                                               engine::Approach::UNRESTRICTED);
+    candidates.reserve(nearest_candidates.size() + 8);
+    for (const auto &candidate : nearest_candidates)
+    {
+        candidates.push_back(candidate.phantom_node);
+    }
+
+    // Some samples snap to tiny/disconnected components even when a nearby routable edge exists.
+    // Append a nearest big-component alternative as a fallback candidate set.
+    const auto alternatives = facade.NearestCandidatesWithAlternativeFromBigComponent(
+        sample.coordinate, std::nullopt, std::nullopt, engine::Approach::UNRESTRICTED, true);
+    for (const auto &fallback_candidate : alternatives.second)
+    {
+        candidates.push_back(fallback_candidate);
+    }
+
     if (candidates.empty())
     {
         ++stats.no_candidate_samples;
@@ -531,6 +548,7 @@ bool mapSampleToCost(const CHDataFacade &facade,
                                     const bool forward_state,
                                     EdgeWeight &offset) -> bool
     {
+        const bool source_side = orientation == PHASTOrientation::Reverse;
         if (metric_kind == MetricKind::Duration)
         {
             const auto duration =
@@ -545,13 +563,22 @@ bool mapSampleToCost(const CHDataFacade &facade,
             {
                 return false;
             }
-            offset = to_alias<EdgeWeight>(duration_value);
+            const auto signed_offset = source_side ? -duration_value : duration_value;
+            offset = to_alias<EdgeWeight>(signed_offset);
             return true;
         }
 
         offset = forward_state ? phantom.GetForwardWeightPlusOffset()
                                : phantom.GetReverseWeightPlusOffset();
-        return offset != INVALID_EDGE_WEIGHT && offset >= EdgeWeight{0};
+        if (offset == INVALID_EDGE_WEIGHT)
+        {
+            return false;
+        }
+        if (source_side)
+        {
+            offset = EdgeWeight{0} - offset;
+        }
+        return true;
     };
 
     auto try_add_cost = [](const EdgeWeight lhs, const EdgeWeight rhs, EdgeWeight &sum) -> bool
@@ -574,7 +601,7 @@ bool mapSampleToCost(const CHDataFacade &facade,
     bool any_reachable_state = false;
     for (const auto candidate_index : util::irange<std::size_t>(0, candidates.size()))
     {
-        const auto &phantom = candidates[candidate_index].phantom_node;
+        const auto &phantom = candidates[candidate_index];
         EdgeWeight best_candidate_cost = INVALID_EDGE_WEIGHT;
         bool candidate_has_valid_state = false;
         bool candidate_has_reachable_state = false;
@@ -610,8 +637,9 @@ bool mapSampleToCost(const CHDataFacade &facade,
             EdgeWeight total_cost = INVALID_EDGE_WEIGHT;
             if (!try_add_cost(state_cost, source_offset, total_cost))
             {
-                util::Log(logERROR) << "Overflow while adding source offset to state cost.";
-                return false;
+                // Source-side offsets can legitimately invalidate one directional state
+                // (e.g. negative intermediate total). Skip and continue with other states.
+                return true;
             }
 
             if (best_candidate_cost == INVALID_EDGE_WEIGHT || total_cost < best_candidate_cost)
