@@ -104,10 +104,20 @@ struct CellAggregate
     EdgeWeight min_cost = INVALID_EDGE_WEIGHT;
 };
 
+struct RasterizationStats
+{
+    std::size_t mapped_samples = 0;
+    std::size_t fallback_candidate_used_samples = 0;
+    std::size_t no_candidate_samples = 0;
+    std::size_t no_valid_state_samples = 0;
+    std::size_t unreachable_state_samples = 0;
+};
+
 using CHDataFacade =
     engine::datafacade::ContiguousInternalMemoryDataFacade<engine::routing_algorithms::ch::Algorithm>;
 
 constexpr std::uint32_t PHASTFIELD_SCHEMA_VERSION = 1;
+constexpr std::size_t MAX_SNAP_CANDIDATES = 8;
 
 std::string trim(const std::string &value)
 {
@@ -490,60 +500,175 @@ bool loadSamplePoints(const std::filesystem::path &path,
 
 bool mapSampleToCost(const CHDataFacade &facade,
                      const SamplePoint &sample,
+                     const MetricKind metric_kind,
+                     const PHASTOrientation orientation,
                      const std::vector<EdgeWeight> &costs,
-                     EdgeWeight &mapped_cost)
+                     EdgeWeight &mapped_cost,
+                     RasterizationStats &stats)
 {
     mapped_cost = INVALID_EDGE_WEIGHT;
     auto candidates = facade.NearestPhantomNodes(sample.coordinate,
-                                                 1,
+                                                 MAX_SNAP_CANDIDATES,
                                                  std::nullopt,
                                                  std::nullopt,
                                                  engine::Approach::UNRESTRICTED);
     if (candidates.empty())
     {
-        return false;
+        ++stats.no_candidate_samples;
+        return true;
     }
 
-    const auto &phantom = candidates.front().phantom_node;
-    auto update_cost = [&](const SegmentID segment_id) -> bool
+    auto is_state_valid = [&](const engine::PhantomNode &phantom, const bool forward_state) -> bool
     {
-        if (!segment_id.enabled)
+        if (orientation == PHASTOrientation::Reverse)
         {
+            return forward_state ? phantom.IsValidForwardSource() : phantom.IsValidReverseSource();
+        }
+        return forward_state ? phantom.IsValidForwardTarget() : phantom.IsValidReverseTarget();
+    };
+
+    auto convert_state_offset = [&](const engine::PhantomNode &phantom,
+                                    const bool forward_state,
+                                    EdgeWeight &offset) -> bool
+    {
+        if (metric_kind == MetricKind::Duration)
+        {
+            const auto duration =
+                forward_state ? phantom.GetForwardDuration() : phantom.GetReverseDuration();
+            if (duration == MAXIMAL_EDGE_DURATION)
+            {
+                return false;
+            }
+            const auto duration_value = from_alias<std::int64_t>(duration);
+            const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+            if (duration_value < 0 || duration_value > max_valid)
+            {
+                return false;
+            }
+            offset = to_alias<EdgeWeight>(duration_value);
             return true;
         }
 
-        const auto node_id = segment_id.id;
-        if (node_id >= costs.size())
+        offset = forward_state ? phantom.GetForwardWeightPlusOffset()
+                               : phantom.GetReverseWeightPlusOffset();
+        return offset != INVALID_EDGE_WEIGHT && offset >= EdgeWeight{0};
+    };
+
+    auto try_add_cost = [](const EdgeWeight lhs, const EdgeWeight rhs, EdgeWeight &sum) -> bool
+    {
+        if (lhs == INVALID_EDGE_WEIGHT || rhs == INVALID_EDGE_WEIGHT)
         {
-            util::Log(logERROR) << "Nearest phantom node id out of bounds: " << node_id;
             return false;
         }
-
-        const auto candidate_cost = costs[node_id];
-        if (candidate_cost == INVALID_EDGE_WEIGHT)
+        const auto total = from_alias<std::int64_t>(lhs) + from_alias<std::int64_t>(rhs);
+        const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+        if (total < 0 || total > max_valid)
         {
-            return true;
+            return false;
         }
-        if (mapped_cost == INVALID_EDGE_WEIGHT || candidate_cost < mapped_cost)
-        {
-            mapped_cost = candidate_cost;
-        }
+        sum = to_alias<EdgeWeight>(total);
         return true;
     };
 
-    if (!update_cost(phantom.forward_segment_id) || !update_cost(phantom.reverse_segment_id))
+    bool any_valid_state = false;
+    bool any_reachable_state = false;
+    for (const auto candidate_index : util::irange<std::size_t>(0, candidates.size()))
     {
-        return false;
+        const auto &phantom = candidates[candidate_index].phantom_node;
+        EdgeWeight best_candidate_cost = INVALID_EDGE_WEIGHT;
+        bool candidate_has_valid_state = false;
+        bool candidate_has_reachable_state = false;
+
+        auto evaluate_state = [&](const SegmentID segment_id, const bool forward_state) -> bool
+        {
+            if (!segment_id.enabled || !is_state_valid(phantom, forward_state))
+            {
+                return true;
+            }
+
+            candidate_has_valid_state = true;
+            const auto node_id = segment_id.id;
+            if (node_id >= costs.size())
+            {
+                util::Log(logERROR) << "Nearest phantom node id out of bounds: " << node_id;
+                return false;
+            }
+
+            const auto state_cost = costs[node_id];
+            if (state_cost == INVALID_EDGE_WEIGHT)
+            {
+                return true;
+            }
+            candidate_has_reachable_state = true;
+
+            EdgeWeight source_offset = INVALID_EDGE_WEIGHT;
+            if (!convert_state_offset(phantom, forward_state, source_offset))
+            {
+                return true;
+            }
+
+            EdgeWeight total_cost = INVALID_EDGE_WEIGHT;
+            if (!try_add_cost(state_cost, source_offset, total_cost))
+            {
+                util::Log(logERROR) << "Overflow while adding source offset to state cost.";
+                return false;
+            }
+
+            if (best_candidate_cost == INVALID_EDGE_WEIGHT || total_cost < best_candidate_cost)
+            {
+                best_candidate_cost = total_cost;
+            }
+            return true;
+        };
+
+        if (!evaluate_state(phantom.forward_segment_id, true) ||
+            !evaluate_state(phantom.reverse_segment_id, false))
+        {
+            return false;
+        }
+
+        any_valid_state = any_valid_state || candidate_has_valid_state;
+        any_reachable_state = any_reachable_state || candidate_has_reachable_state;
+
+        if (best_candidate_cost == INVALID_EDGE_WEIGHT)
+        {
+            continue;
+        }
+
+        mapped_cost = best_candidate_cost;
+        if (candidate_index > 0)
+        {
+            ++stats.fallback_candidate_used_samples;
+        }
+        break;
     }
+
+    if (mapped_cost != INVALID_EDGE_WEIGHT)
+    {
+        ++stats.mapped_samples;
+    }
+    else if (!any_valid_state)
+    {
+        ++stats.no_valid_state_samples;
+    }
+    else if (!any_reachable_state)
+    {
+        ++stats.unreachable_state_samples;
+    }
+
     return true;
 }
 
 bool rasterizeToCells(const CHDataFacade &facade,
                       const std::vector<SamplePoint> &samples,
+                      const MetricKind metric_kind,
+                      const PHASTOrientation orientation,
                       const std::vector<EdgeWeight> &costs,
-                      std::unordered_map<std::string, CellAggregate> &cells)
+                      std::unordered_map<std::string, CellAggregate> &cells,
+                      RasterizationStats &stats)
 {
     cells.clear();
+    stats = {};
     if (costs.empty())
     {
         util::Log(logERROR) << "Cost vector is empty.";
@@ -553,7 +678,7 @@ bool rasterizeToCells(const CHDataFacade &facade,
     for (const auto &sample : samples)
     {
         EdgeWeight mapped_cost = INVALID_EDGE_WEIGHT;
-        if (!mapSampleToCost(facade, sample, costs, mapped_cost))
+        if (!mapSampleToCost(facade, sample, metric_kind, orientation, costs, mapped_cost, stats))
         {
             return false;
         }
@@ -704,7 +829,14 @@ try
     util::Log() << "Loaded sample points: " << samples.size();
 
     std::unordered_map<std::string, CellAggregate> cells;
-    if (!rasterizeToCells(*facade, samples, field_data.costs, cells))
+    RasterizationStats rasterization_stats;
+    if (!rasterizeToCells(*facade,
+                          samples,
+                          field_data.metric_kind,
+                          field_data.orientation,
+                          field_data.costs,
+                          cells,
+                          rasterization_stats))
     {
         return EXIT_FAILURE;
     }
@@ -723,6 +855,13 @@ try
     util::Log() << "Rasterized cells: " << cells.size();
     util::Log() << "Reachable cells: " << reachable_cells;
     util::Log() << "Unreachable cells: " << unreachable_cells;
+    util::Log() << "Mapped samples: " << rasterization_stats.mapped_samples;
+    util::Log() << "Fallback snap candidate used: "
+                << rasterization_stats.fallback_candidate_used_samples;
+    util::Log() << "Samples with no snap candidates: " << rasterization_stats.no_candidate_samples;
+    util::Log() << "Samples with no valid start states: " << rasterization_stats.no_valid_state_samples;
+    util::Log() << "Samples with valid states but unreachable field values: "
+                << rasterization_stats.unreachable_state_samples;
     util::Log() << "PHAST rasterization prototype complete.";
 
     util::DumpMemoryStats();
