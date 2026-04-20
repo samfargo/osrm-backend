@@ -505,9 +505,14 @@ bool DeriveAdjacency(const contractor::QueryGraph &graph,
 {
     const auto node_count = phast_data.node_count;
     std::vector<DerivedArc> upward_arcs;
-    std::vector<DerivedArc> downward_arcs;
+    std::vector<DerivedArc> pre_synthesis_downward_arcs;
     upward_arcs.reserve(graph.GetNumberOfEdges());
-    downward_arcs.reserve(graph.GetNumberOfEdges());
+    pre_synthesis_downward_arcs.reserve(graph.GetNumberOfEdges());
+    adjacency.oriented_arc_count = 0;
+    adjacency.skipped_self_loops = 0;
+    adjacency.pre_synthesis_upward_arc_count = 0;
+    adjacency.pre_synthesis_downward_arc_count = 0;
+    adjacency.downward_built_from_transpose = false;
 
     for (const auto source : util::irange<NodeID>(0, node_count))
     {
@@ -558,10 +563,12 @@ bool DeriveAdjacency(const contractor::QueryGraph &graph,
             if (is_upward)
             {
                 upward_arcs.push_back(arc);
+                ++adjacency.pre_synthesis_upward_arc_count;
             }
             else
             {
-                downward_arcs.push_back(arc);
+                pre_synthesis_downward_arcs.push_back(arc);
+                ++adjacency.pre_synthesis_downward_arc_count;
             }
         }
     }
@@ -572,28 +579,37 @@ bool DeriveAdjacency(const contractor::QueryGraph &graph,
         return false;
     }
 
-    if (upward_arcs.empty() && !downward_arcs.empty())
-    {
-        upward_arcs.reserve(downward_arcs.size());
-        for (const auto &arc : downward_arcs)
-        {
-            upward_arcs.push_back({arc.target, arc.source, arc.cost});
-        }
-    }
-    if (downward_arcs.empty() && !upward_arcs.empty())
-    {
-        downward_arcs.reserve(upward_arcs.size());
-        for (const auto &arc : upward_arcs)
-        {
-            downward_arcs.push_back({arc.target, arc.source, arc.cost});
-        }
-    }
+    util::Log() << "Pre-synthesis arc split: oriented=" << adjacency.oriented_arc_count
+                << ", upward=" << adjacency.pre_synthesis_upward_arc_count
+                << ", downward=" << adjacency.pre_synthesis_downward_arc_count
+                << ", skipped_self_loops=" << adjacency.skipped_self_loops;
 
-    if (upward_arcs.empty() || downward_arcs.empty())
+    // PHAST runtime graph contract:
+    // 1) Keep orientation-valid arcs that move upward in rank.
+    // 2) Build downward adjacency as the exact transpose of those upward arcs.
+    // This makes the derived downward DAG construction explicit and deterministic.
+    if (upward_arcs.empty())
     {
-        util::Log(logERROR) << "Could not derive both upward and downward adjacency sets.";
+        util::Log(logERROR) << "Pre-synthesis upward arc set is empty. Cannot build PHAST runtime DAG.";
         return false;
     }
+
+    if (!pre_synthesis_downward_arcs.empty())
+    {
+        util::Log(logERROR)
+            << "Pre-synthesis downward arcs were found in orientation-filtered CH graph ("
+            << pre_synthesis_downward_arcs.size()
+            << "). This violates the current PHAST derivation contract.";
+        return false;
+    }
+
+    std::vector<DerivedArc> downward_arcs;
+    downward_arcs.reserve(upward_arcs.size());
+    for (const auto &arc : upward_arcs)
+    {
+        downward_arcs.push_back({arc.target, arc.source, arc.cost});
+    }
+    adjacency.downward_built_from_transpose = true;
 
     BuildCSR(upward_arcs, node_count, adjacency.up_offsets, adjacency.up_targets, adjacency.up_costs);
     BuildCSR(

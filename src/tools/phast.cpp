@@ -185,6 +185,10 @@ try
     util::Log() << "Runtime orientation: "
                 << osrm::contractor::phast::OrientationToString(selected_orientation);
     util::Log() << "Runtime exclude index: " << selected_exclude_index;
+    util::Log() << "Pre-synthesis upward arcs: " << adjacency.pre_synthesis_upward_arc_count;
+    util::Log() << "Pre-synthesis downward arcs: " << adjacency.pre_synthesis_downward_arc_count;
+    util::Log() << "Downward adjacency built from transpose: "
+                << (adjacency.downward_built_from_transpose ? "yes" : "no");
     util::Log() << "Derived upward arcs: " << adjacency.up_targets.size();
     util::Log() << "Derived downward arcs: " << adjacency.down_targets.size();
     util::Log() << "Seed count: " << seeds.size();

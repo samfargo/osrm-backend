@@ -31,6 +31,9 @@ struct DerivedAdjacency
     std::vector<EdgeWeight> down_costs;
     std::size_t oriented_arc_count = 0;
     std::size_t skipped_self_loops = 0;
+    std::size_t pre_synthesis_upward_arc_count = 0;
+    std::size_t pre_synthesis_downward_arc_count = 0;
+    bool downward_built_from_transpose = false;
 };
 
 const char *OrientationToString(contractor::PHASTOrientation orientation);
