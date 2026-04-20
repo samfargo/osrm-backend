@@ -37,6 +37,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace osrm;
@@ -62,7 +63,10 @@ struct RuntimeConfig final
     std::uint32_t expected_resolution = 9;
     std::uint32_t oracle_max_samples = 256;
     std::int32_t oracle_tolerance_ticks = 15;
+    std::uint32_t oracle_trace_limit = 10;
     bool oracle_enabled = false;
+    bool oracle_strict_endpoints = false;
+    bool oracle_report_all = false;
 };
 
 enum class return_code : unsigned
@@ -131,6 +135,64 @@ struct OracleStats
     std::size_t unreachable_pairs = 0;
     std::size_t mismatches = 0;
     std::int64_t max_abs_error_ticks = 0;
+};
+
+struct OracleComparison
+{
+    std::size_t sample_position = 0;
+    std::size_t sample_index = 0;
+    bool raster_reachable = false;
+    bool oracle_reachable = false;
+    std::int64_t raster_ticks = 0;
+    std::int64_t oracle_ticks = 0;
+    std::int64_t delta_ticks = 0;
+    std::int64_t abs_error_ticks = 0;
+    bool mismatch = false;
+    std::string mismatch_reason;
+    std::vector<std::optional<std::int64_t>> oracle_ticks_by_poi;
+};
+
+struct StrictSeedEndpoint
+{
+    std::size_t poi_index = 0;
+    bool forward_state = false;
+    NodeID state_node_id = SPECIAL_SEGMENTID;
+    EdgeWeight seed_offset = INVALID_EDGE_WEIGHT;
+    util::Coordinate coordinate;
+    engine::PhantomNode restricted_phantom;
+};
+
+struct StrictOracleStats
+{
+    std::size_t compared_samples = 0;
+    std::size_t reachable_pairs = 0;
+    std::size_t unreachable_pairs = 0;
+    std::size_t mismatches = 0;
+    std::size_t coordinate_mismatches_resolved = 0;
+    std::int64_t max_abs_error_ticks = 0;
+    std::size_t state_compared_samples = 0;
+    std::size_t state_reachable_pairs = 0;
+    std::size_t state_unreachable_pairs = 0;
+    std::size_t state_mismatches = 0;
+    std::int64_t state_max_abs_error_ticks = 0;
+    std::size_t endpoint_semantics_mismatch_samples = 0;
+};
+
+struct SampleMappingTrace
+{
+    bool has_snap_candidates = false;
+    std::size_t snap_candidate_count = 0;
+    std::size_t chosen_candidate_index = std::numeric_limits<std::size_t>::max();
+    NodeID chosen_forward_segment_id = SPECIAL_SEGMENTID;
+    bool chosen_forward_segment_enabled = false;
+    NodeID chosen_reverse_segment_id = SPECIAL_SEGMENTID;
+    bool chosen_reverse_segment_enabled = false;
+    bool has_chosen_state = false;
+    NodeID chosen_state_node_id = SPECIAL_SEGMENTID;
+    bool chosen_state_forward = false;
+    EdgeWeight chosen_state_cost = INVALID_EDGE_WEIGHT;
+    EdgeWeight chosen_source_offset = INVALID_EDGE_WEIGHT;
+    EdgeWeight chosen_total_cost = INVALID_EDGE_WEIGHT;
 };
 
 using CHDataFacade =
@@ -205,7 +267,15 @@ parseArguments(int argc,
         "Allowed absolute error in decisecond ticks between rasterized and oracle durations")(
         "oracle-mismatch-report",
         boost::program_options::value<std::filesystem::path>(&runtime_config.oracle_mismatch_report_path),
-        "Optional CSV path for oracle mismatches");
+        "Optional CSV path for oracle mismatches")(
+        "oracle-trace-limit",
+        boost::program_options::value<std::uint32_t>(&runtime_config.oracle_trace_limit)
+            ->default_value(10),
+        "Maximum number of mismatch/pass traces to log for oracle debugging")(
+        "oracle-strict-endpoints",
+        "Also run strict endpoint oracle pinned to the same snapped source/seed states")(
+        "oracle-report-all",
+        "Write all oracle comparisons (not only mismatches) to --oracle-mismatch-report");
 
     boost::program_options::options_description hidden_options("Hidden options");
     hidden_options.add_options()(
@@ -293,6 +363,8 @@ parseArguments(int argc,
     }
     runtime_config.oracle_enabled =
         option_variables.contains("oracle-poi-file") && !runtime_config.oracle_poi_file.empty();
+    runtime_config.oracle_strict_endpoints = option_variables.contains("oracle-strict-endpoints");
+    runtime_config.oracle_report_all = option_variables.contains("oracle-report-all");
     return return_code::ok;
 }
 
@@ -659,20 +731,136 @@ bool extractDurationTicks(const json::Value &value, bool &is_reachable, std::int
     return false;
 }
 
+std::string edgeWeightToString(const EdgeWeight value)
+{
+    if (value == INVALID_EDGE_WEIGHT)
+    {
+        return "invalid";
+    }
+    return std::to_string(from_alias<std::int64_t>(value));
+}
+
+std::string formatOraclePOITicks(const std::vector<std::optional<std::int64_t>> &ticks_by_poi,
+                                 const std::vector<util::Coordinate> &pois)
+{
+    std::ostringstream stream;
+    stream << "[";
+    for (const auto poi_index : util::irange<std::size_t>(0, ticks_by_poi.size()))
+    {
+        if (poi_index > 0)
+        {
+            stream << ", ";
+        }
+        stream << "poi" << poi_index << "("
+               << static_cast<double>(util::toFloating(pois[poi_index].lon)) << ","
+               << static_cast<double>(util::toFloating(pois[poi_index].lat)) << ")=";
+        if (!ticks_by_poi[poi_index].has_value())
+        {
+            stream << "null";
+            continue;
+        }
+        stream << ticks_by_poi[poi_index].value();
+    }
+    stream << "]";
+    return stream.str();
+}
+
+void logOracleMismatchTrace(const SamplePoint &sample,
+                            const SampleMappingTrace &trace,
+                            const std::vector<std::optional<std::int64_t>> &oracle_ticks_by_poi,
+                            const std::vector<util::Coordinate> &pois,
+                            const std::string &mismatch_reason)
+{
+    util::Log(logERROR) << "Oracle mismatch trace: sample_index=" << sample.sample_index
+                        << ", h3_id=" << sample.h3_id
+                        << ", lon=" << static_cast<double>(util::toFloating(sample.coordinate.lon))
+                        << ", lat=" << static_cast<double>(util::toFloating(sample.coordinate.lat))
+                        << ", reason=" << mismatch_reason;
+    util::Log(logERROR) << "  snap: candidate_count=" << trace.snap_candidate_count
+                        << ", chosen_candidate_index="
+                        << (trace.chosen_candidate_index == std::numeric_limits<std::size_t>::max()
+                                ? std::string("none")
+                                : std::to_string(trace.chosen_candidate_index))
+                        << ", chosen_forward_segment="
+                        << (trace.chosen_forward_segment_enabled
+                                ? std::to_string(trace.chosen_forward_segment_id)
+                                : std::string("disabled"))
+                        << ", chosen_reverse_segment="
+                        << (trace.chosen_reverse_segment_enabled
+                                ? std::to_string(trace.chosen_reverse_segment_id)
+                                : std::string("disabled"));
+    util::Log(logERROR) << "  raster: chosen_state_node="
+                        << (trace.has_chosen_state ? std::to_string(trace.chosen_state_node_id)
+                                                   : std::string("none"))
+                        << ", state_direction="
+                        << (trace.has_chosen_state
+                                ? (trace.chosen_state_forward ? "forward" : "reverse")
+                                : "none")
+                        << ", source_offset=" << edgeWeightToString(trace.chosen_source_offset)
+                        << ", phast_state_cost=" << edgeWeightToString(trace.chosen_state_cost)
+                        << ", raster_total=" << edgeWeightToString(trace.chosen_total_cost);
+    util::Log(logERROR) << "  oracle: poi_ticks="
+                        << formatOraclePOITicks(oracle_ticks_by_poi, pois);
+}
+
+void logOraclePassTrace(const SamplePoint &sample,
+                        const SampleMappingTrace &trace,
+                        const std::vector<std::optional<std::int64_t>> &oracle_ticks_by_poi,
+                        const std::vector<util::Coordinate> &pois,
+                        const std::int64_t delta_ticks)
+{
+    util::Log() << "Oracle pass trace: sample_index=" << sample.sample_index
+                << ", h3_id=" << sample.h3_id
+                << ", lon=" << static_cast<double>(util::toFloating(sample.coordinate.lon))
+                << ", lat=" << static_cast<double>(util::toFloating(sample.coordinate.lat))
+                << ", delta_ticks(raster-table)=" << delta_ticks;
+    util::Log() << "  snap: candidate_count=" << trace.snap_candidate_count
+                << ", chosen_candidate_index="
+                << (trace.chosen_candidate_index == std::numeric_limits<std::size_t>::max()
+                        ? std::string("none")
+                        : std::to_string(trace.chosen_candidate_index))
+                << ", chosen_forward_segment="
+                << (trace.chosen_forward_segment_enabled ? std::to_string(trace.chosen_forward_segment_id)
+                                                         : std::string("disabled"))
+                << ", chosen_reverse_segment="
+                << (trace.chosen_reverse_segment_enabled ? std::to_string(trace.chosen_reverse_segment_id)
+                                                         : std::string("disabled"));
+    util::Log() << "  raster: chosen_state_node="
+                << (trace.has_chosen_state ? std::to_string(trace.chosen_state_node_id)
+                                           : std::string("none"))
+                << ", state_direction="
+                << (trace.has_chosen_state ? (trace.chosen_state_forward ? "forward" : "reverse")
+                                           : "none")
+                << ", source_offset=" << edgeWeightToString(trace.chosen_source_offset)
+                << ", phast_state_cost=" << edgeWeightToString(trace.chosen_state_cost)
+                << ", raster_total=" << edgeWeightToString(trace.chosen_total_cost);
+    util::Log() << "  oracle: poi_ticks=" << formatOraclePOITicks(oracle_ticks_by_poi, pois);
+}
+
 bool runDurationOracle(const std::filesystem::path &base_path,
                        const PHASTOrientation orientation,
                        const std::vector<SamplePoint> &samples,
                        const std::vector<EdgeWeight> &sample_costs,
+                       const std::vector<SampleMappingTrace> &sample_traces,
                        const std::vector<util::Coordinate> &pois,
                        const std::uint32_t oracle_max_samples,
                        const std::int64_t tolerance_ticks,
                        const std::filesystem::path &mismatch_report_path,
-                       OracleStats &stats)
+                       const bool report_all,
+                       const std::size_t trace_limit,
+                       OracleStats &stats,
+                       std::vector<OracleComparison> &comparisons)
 {
     stats = {};
+    comparisons.clear();
     if (samples.size() != sample_costs.size())
     {
         util::Log(logERROR) << "Oracle input mismatch: samples and sample costs differ in size.";
+        return false;
+    }
+    if (samples.size() != sample_traces.size())
+    {
+        util::Log(logERROR) << "Oracle input mismatch: samples and traces differ in size.";
         return false;
     }
     if (samples.empty())
@@ -692,6 +880,7 @@ bool runDurationOracle(const std::filesystem::path &base_path,
         util::Log(logERROR) << "Oracle selected zero samples.";
         return false;
     }
+    comparisons.reserve(selected_sample_indices.size());
 
     engine::EngineConfig engine_config;
     engine_config.storage_config = storage::StorageConfig(base_path);
@@ -783,9 +972,13 @@ bool runDurationOracle(const std::filesystem::path &base_path,
             return false;
         }
         mismatch_report
-            << "sample_index,h3_id,lon,lat,raster_ticks,oracle_ticks,oracle_seconds,abs_error_ticks,reason\n";
+            << "sample_index,h3_id,lon,lat,raster_ticks,oracle_ticks,oracle_seconds,abs_error_ticks,reason,"
+            << "chosen_candidate_index,chosen_state_node,state_direction,source_offset,phast_state_cost,"
+            << "raster_total,delta_ticks\n";
     }
 
+    std::size_t pass_trace_count = 0;
+    std::size_t mismatch_trace_count = 0;
     for (const auto local_sample_index : util::irange<std::size_t>(0, selected_sample_indices.size()))
     {
         const auto sample_index = selected_sample_indices[local_sample_index];
@@ -793,6 +986,7 @@ bool runDurationOracle(const std::filesystem::path &base_path,
 
         bool oracle_reachable = false;
         std::int64_t oracle_best_ticks = 0;
+        std::vector<std::optional<std::int64_t>> oracle_ticks_by_poi(pois.size(), std::nullopt);
 
         if (orientation == PHASTOrientation::Reverse)
         {
@@ -804,8 +998,9 @@ bool runDurationOracle(const std::filesystem::path &base_path,
                 return false;
             }
 
-            for (const auto &entry : row)
+            for (const auto poi_index : util::irange<std::size_t>(0, row.size()))
             {
+                const auto &entry = row[poi_index];
                 bool reachable = false;
                 std::int64_t ticks = 0;
                 if (!extractDurationTicks(entry, reachable, ticks))
@@ -816,6 +1011,7 @@ bool runDurationOracle(const std::filesystem::path &base_path,
                 {
                     continue;
                 }
+                oracle_ticks_by_poi[poi_index] = ticks;
                 if (!oracle_reachable || ticks < oracle_best_ticks)
                 {
                     oracle_reachable = true;
@@ -845,6 +1041,7 @@ bool runDurationOracle(const std::filesystem::path &base_path,
                 {
                     continue;
                 }
+                oracle_ticks_by_poi[row_index] = ticks;
                 if (!oracle_reachable || ticks < oracle_best_ticks)
                 {
                     oracle_reachable = true;
@@ -856,8 +1053,10 @@ bool runDurationOracle(const std::filesystem::path &base_path,
         ++stats.compared_samples;
         const auto raster_cost = sample_costs[sample_index];
         const auto raster_reachable = raster_cost != INVALID_EDGE_WEIGHT;
+        const auto raster_ticks = raster_reachable ? from_alias<std::int64_t>(raster_cost) : 0;
 
         bool mismatch = false;
+        std::int64_t delta_ticks = 0;
         std::int64_t abs_error_ticks = 0;
         std::string mismatch_reason;
         if (!raster_reachable && !oracle_reachable)
@@ -877,8 +1076,8 @@ bool runDurationOracle(const std::filesystem::path &base_path,
         else
         {
             ++stats.reachable_pairs;
-            const auto raster_ticks = from_alias<std::int64_t>(raster_cost);
-            abs_error_ticks = std::llabs(raster_ticks - oracle_best_ticks);
+            delta_ticks = raster_ticks - oracle_best_ticks;
+            abs_error_ticks = std::llabs(delta_ticks);
             if (abs_error_ticks > tolerance_ticks)
             {
                 mismatch = true;
@@ -887,20 +1086,45 @@ bool runDurationOracle(const std::filesystem::path &base_path,
             stats.max_abs_error_ticks = std::max(stats.max_abs_error_ticks, abs_error_ticks);
         }
 
-        if (!mismatch)
+        comparisons.push_back(OracleComparison{
+            local_sample_index,
+            sample_index,
+            raster_reachable,
+            oracle_reachable,
+            raster_ticks,
+            oracle_reachable ? oracle_best_ticks : 0,
+            delta_ticks,
+            abs_error_ticks,
+            mismatch,
+            mismatch ? mismatch_reason : std::string("ok"),
+            oracle_ticks_by_poi});
+
+        if (mismatch)
         {
-            continue;
+            ++stats.mismatches;
+            if (mismatch_trace_count < trace_limit)
+            {
+                logOracleMismatchTrace(sample,
+                                       sample_traces[sample_index],
+                                       oracle_ticks_by_poi,
+                                       pois,
+                                       mismatch_reason);
+                ++mismatch_trace_count;
+            }
+        }
+        else if (pass_trace_count < std::min<std::size_t>(trace_limit, 2))
+        {
+            logOraclePassTrace(sample,
+                               sample_traces[sample_index],
+                               oracle_ticks_by_poi,
+                               pois,
+                               delta_ticks);
+            ++pass_trace_count;
         }
 
-        ++stats.mismatches;
-        if (stats.mismatches <= 10)
+        if (!mismatch_report_path.empty() && (report_all || mismatch))
         {
-            util::Log(logERROR) << "Oracle mismatch at sample_index=" << sample.sample_index
-                                << " h3_id=" << sample.h3_id
-                                << " reason=" << mismatch_reason;
-        }
-        if (!mismatch_report_path.empty())
-        {
+            const auto &trace = sample_traces[sample_index];
             mismatch_report << sample.sample_index << "," << sample.h3_id << ","
                             << static_cast<double>(util::toFloating(sample.coordinate.lon)) << ","
                             << static_cast<double>(util::toFloating(sample.coordinate.lat)) << ",";
@@ -914,18 +1138,632 @@ bool runDurationOracle(const std::filesystem::path &base_path,
                 mismatch_report << oracle_best_ticks << "," << std::fixed << std::setprecision(1)
                                 << (oracle_best_ticks / 10.0);
             }
-            mismatch_report << "," << abs_error_ticks << "," << mismatch_reason << "\n";
+            mismatch_report << "," << abs_error_ticks << "," << mismatch_reason << ",";
+            if (trace.chosen_candidate_index == std::numeric_limits<std::size_t>::max())
+            {
+                mismatch_report << ",";
+            }
+            else
+            {
+                mismatch_report << trace.chosen_candidate_index << ",";
+            }
+            if (trace.has_chosen_state)
+            {
+                mismatch_report << trace.chosen_state_node_id << ","
+                                << (trace.chosen_state_forward ? "forward" : "reverse") << ","
+                                << edgeWeightToString(trace.chosen_source_offset) << ","
+                                << edgeWeightToString(trace.chosen_state_cost) << ","
+                                << edgeWeightToString(trace.chosen_total_cost);
+            }
+            else
+            {
+                mismatch_report << ",,,,"; // chosen_state_node,state_direction,source_offset,phast_state_cost,raster_total
+            }
+            mismatch_report << "," << delta_ticks << "\n";
         }
     }
 
-    if (stats.mismatches > 0)
+    return true;
+}
+
+bool convertDurationOffset(const engine::PhantomNode &phantom,
+                           const bool forward_state,
+                           EdgeWeight &offset)
+{
+    const auto duration = forward_state ? phantom.GetForwardDuration() : phantom.GetReverseDuration();
+    if (duration == MAXIMAL_EDGE_DURATION)
     {
-        util::Log(logERROR) << "Oracle validation failed with " << stats.mismatches
-                            << " mismatches out of " << stats.compared_samples << " compared samples.";
+        return false;
+    }
+    const auto duration_value = from_alias<std::int64_t>(duration);
+    const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+    if (duration_value < 0 || duration_value > max_valid)
+    {
+        return false;
+    }
+    offset = to_alias<EdgeWeight>(duration_value);
+    return true;
+}
+
+bool getOrientationSeedValidity(const engine::PhantomNode &phantom,
+                                const PHASTOrientation orientation,
+                                bool &forward_valid,
+                                bool &reverse_valid)
+{
+    if (orientation == PHASTOrientation::Reverse)
+    {
+        forward_valid = phantom.IsValidForwardTarget();
+        reverse_valid = phantom.IsValidReverseTarget();
+        return true;
+    }
+    if (orientation == PHASTOrientation::Forward)
+    {
+        forward_valid = phantom.IsValidForwardSource();
+        reverse_valid = phantom.IsValidReverseSource();
+        return true;
+    }
+    return false;
+}
+
+engine::PhantomNode restrictPhantomToSingleState(const engine::PhantomNode &phantom,
+                                                 const bool forward_state)
+{
+    auto restricted = phantom;
+    if (forward_state)
+    {
+        restricted.reverse_segment_id = SegmentID{SPECIAL_SEGMENTID, false};
+    }
+    else
+    {
+        restricted.forward_segment_id = SegmentID{SPECIAL_SEGMENTID, false};
+    }
+    return restricted;
+}
+
+engine::Hint makeHintFromPhantom(const engine::PhantomNode &phantom, const std::uint32_t checksum)
+{
+    engine::SegmentHint segment_hint;
+    segment_hint.phantom = phantom;
+    segment_hint.data_checksum = checksum;
+    engine::Hint hint;
+    hint.segment_hints.push_back(segment_hint);
+    return hint;
+}
+
+engine::PhantomNode makeZeroStateOffsetPhantom(const engine::PhantomNode &phantom, const bool forward_state)
+{
+    auto adjusted = phantom;
+    if (forward_state)
+    {
+        adjusted.forward_weight = EdgeWeight{0};
+        adjusted.forward_weight_offset = EdgeWeight{0};
+        adjusted.forward_duration = EdgeDuration{0};
+        adjusted.forward_duration_offset = EdgeDuration{0};
+        adjusted.forward_distance = EdgeDistance{0};
+        adjusted.forward_distance_offset = EdgeDistance{0};
+    }
+    else
+    {
+        adjusted.reverse_weight = EdgeWeight{0};
+        adjusted.reverse_weight_offset = EdgeWeight{0};
+        adjusted.reverse_duration = EdgeDuration{0};
+        adjusted.reverse_duration_offset = EdgeDuration{0};
+        adjusted.reverse_distance = EdgeDistance{0};
+        adjusted.reverse_distance_offset = EdgeDistance{0};
+    }
+    return adjusted;
+}
+
+std::string formatStrictSeedTicks(const std::vector<std::optional<std::int64_t>> &ticks_by_seed,
+                                  const std::vector<StrictSeedEndpoint> &seed_endpoints)
+{
+    std::ostringstream stream;
+    stream << "[";
+    for (const auto seed_index : util::irange<std::size_t>(0, seed_endpoints.size()))
+    {
+        if (seed_index > 0)
+        {
+            stream << ", ";
+        }
+        const auto &seed = seed_endpoints[seed_index];
+        stream << "seed" << seed_index << "(poi=" << seed.poi_index
+               << ",dir=" << (seed.forward_state ? "forward" : "reverse")
+               << ",node=" << seed.state_node_id
+               << ",seed_offset=" << edgeWeightToString(seed.seed_offset) << ")=";
+        if (!ticks_by_seed[seed_index].has_value())
+        {
+            stream << "null";
+        }
+        else
+        {
+            stream << ticks_by_seed[seed_index].value();
+        }
+    }
+    stream << "]";
+    return stream.str();
+}
+
+bool buildStrictSeedEndpoints(const CHDataFacade &facade,
+                              const PHASTOrientation orientation,
+                              const std::vector<util::Coordinate> &pois,
+                              std::vector<StrictSeedEndpoint> &seed_endpoints)
+{
+    seed_endpoints.clear();
+    seed_endpoints.reserve(pois.size() * 2);
+
+    for (const auto poi_index : util::irange<std::size_t>(0, pois.size()))
+    {
+        const auto &poi = pois[poi_index];
+        auto alternatives = facade.NearestCandidatesWithAlternativeFromBigComponent(
+            poi, std::nullopt, std::nullopt, engine::Approach::UNRESTRICTED, true);
+
+        engine::PhantomNode snapped;
+        if (!alternatives.first.empty())
+        {
+            snapped = alternatives.first.front();
+        }
+        else if (!alternatives.second.empty())
+        {
+            snapped = alternatives.second.front();
+        }
+        else
+        {
+            util::Log(logERROR) << "Strict endpoint oracle could not snap POI index " << poi_index;
+            return false;
+        }
+
+        bool forward_valid = false;
+        bool reverse_valid = false;
+        if (!getOrientationSeedValidity(snapped, orientation, forward_valid, reverse_valid))
+        {
+            util::Log(logERROR) << "Unsupported orientation while building strict seed endpoints.";
+            return false;
+        }
+        if (!forward_valid && !reverse_valid)
+        {
+            util::Log(logERROR) << "Strict endpoint oracle snapped POI index " << poi_index
+                                << " without orientation-valid seed states.";
+            return false;
+        }
+
+        auto push_seed = [&](const bool forward_state, const SegmentID segment_id) -> bool
+        {
+            if (!segment_id.enabled)
+            {
+                return false;
+            }
+            EdgeWeight seed_offset = INVALID_EDGE_WEIGHT;
+            if (!convertDurationOffset(snapped, forward_state, seed_offset))
+            {
+                util::Log(logERROR) << "Could not convert strict seed offset for POI index "
+                                    << poi_index;
+                return false;
+            }
+            seed_endpoints.push_back(StrictSeedEndpoint{
+                poi_index,
+                forward_state,
+                segment_id.id,
+                seed_offset,
+                poi,
+                restrictPhantomToSingleState(snapped, forward_state)});
+            return true;
+        };
+
+        if (forward_valid && !push_seed(true, snapped.forward_segment_id))
+        {
+            return false;
+        }
+        if (reverse_valid && !push_seed(false, snapped.reverse_segment_id))
+        {
+            return false;
+        }
+    }
+
+    return !seed_endpoints.empty();
+}
+
+bool runStrictEndpointOracle(const std::filesystem::path &base_path,
+                             const CHDataFacade &facade,
+                             const PHASTOrientation orientation,
+                             const std::vector<SamplePoint> &samples,
+                             const std::vector<EdgeWeight> &sample_costs,
+                             const std::vector<SampleMappingTrace> &sample_traces,
+                             const std::vector<util::Coordinate> &pois,
+                             const std::vector<OracleComparison> &coordinate_comparisons,
+                             const std::int64_t tolerance_ticks,
+                             const std::size_t trace_limit,
+                             StrictOracleStats &stats,
+                             std::vector<std::int64_t> &strict_deltas,
+                             std::vector<std::int64_t> &state_deltas)
+{
+    stats = {};
+    strict_deltas.clear();
+    state_deltas.clear();
+    if (samples.size() != sample_costs.size() || samples.size() != sample_traces.size())
+    {
+        util::Log(logERROR) << "Strict endpoint oracle input sizes are inconsistent.";
+        return false;
+    }
+    if (coordinate_comparisons.empty())
+    {
+        util::Log(logERROR) << "Strict endpoint oracle has no coordinate oracle samples to compare.";
         return false;
     }
 
+    std::vector<StrictSeedEndpoint> seed_endpoints;
+    if (!buildStrictSeedEndpoints(facade, orientation, pois, seed_endpoints))
+    {
+        return false;
+    }
+    util::Log() << "Strict endpoint oracle seed states: " << seed_endpoints.size();
+
+    std::unordered_set<std::size_t> coordinate_mismatch_samples;
+    for (const auto &comparison : coordinate_comparisons)
+    {
+        if (comparison.mismatch)
+        {
+            coordinate_mismatch_samples.insert(comparison.sample_index);
+        }
+    }
+
+    engine::EngineConfig engine_config;
+    engine_config.storage_config = storage::StorageConfig(base_path);
+    engine_config.use_shared_memory = false;
+    engine_config.algorithm = engine::EngineConfig::Algorithm::CH;
+    if (!engine_config.IsValid())
+    {
+        util::Log(logERROR) << "Could not initialize strict endpoint oracle: invalid engine config.";
+        return false;
+    }
+    OSRM osrm{engine_config};
+
+    std::size_t logged_mismatch_traces = 0;
+    std::size_t logged_pass_traces = 0;
+    for (const auto &comparison : coordinate_comparisons)
+    {
+        const auto sample_index = comparison.sample_index;
+        const auto &sample = samples[sample_index];
+        const auto &trace = sample_traces[sample_index];
+        if (!trace.has_chosen_state ||
+            trace.chosen_candidate_index == std::numeric_limits<std::size_t>::max())
+        {
+            ++stats.compared_samples;
+            ++stats.unreachable_pairs;
+            continue;
+        }
+
+        auto source_candidates = facade.NearestPhantomNodes(sample.coordinate,
+                                                            MAX_SNAP_CANDIDATES,
+                                                            std::nullopt,
+                                                            std::nullopt,
+                                                            engine::Approach::UNRESTRICTED);
+        const engine::PhantomNode *matched_source_phantom = nullptr;
+        for (const auto &candidate : source_candidates)
+        {
+            const auto segment_id = trace.chosen_state_forward ? candidate.phantom_node.forward_segment_id
+                                                               : candidate.phantom_node.reverse_segment_id;
+            if (segment_id.enabled && segment_id.id == trace.chosen_state_node_id)
+            {
+                matched_source_phantom = &candidate.phantom_node;
+                break;
+            }
+        }
+        if (matched_source_phantom == nullptr)
+        {
+            util::Log(logERROR) << "Strict endpoint oracle could not recover chosen source state for sample "
+                                << sample_index << " (state_node=" << trace.chosen_state_node_id << ").";
+            return false;
+        }
+        const auto source_phantom =
+            restrictPhantomToSingleState(*matched_source_phantom, trace.chosen_state_forward);
+
+        auto run_table_for_source = [&](const engine::PhantomNode &source_hint_phantom,
+                                        const bool zero_target_offsets,
+                                        std::vector<std::optional<std::int64_t>> &ticks_by_seed,
+                                        bool &reachable,
+                                        std::int64_t &best_ticks) -> bool
+        {
+            TableParameters params;
+            params.annotations = TableParameters::AnnotationsType::Duration;
+            params.skip_waypoints = true;
+            params.generate_hints = false;
+            params.coordinates.reserve(seed_endpoints.size() + 1);
+            params.hints.reserve(seed_endpoints.size() + 1);
+            params.destinations.reserve(seed_endpoints.size());
+
+            params.coordinates.push_back(sample.coordinate);
+            params.hints.push_back(makeHintFromPhantom(source_hint_phantom, facade.GetCheckSum()));
+            params.sources.push_back(0);
+            for (const auto seed_index : util::irange<std::size_t>(0, seed_endpoints.size()))
+            {
+                const auto target_phantom = zero_target_offsets
+                                                ? makeZeroStateOffsetPhantom(
+                                                      seed_endpoints[seed_index].restricted_phantom,
+                                                      seed_endpoints[seed_index].forward_state)
+                                                : seed_endpoints[seed_index].restricted_phantom;
+                params.coordinates.push_back(seed_endpoints[seed_index].coordinate);
+                params.hints.push_back(makeHintFromPhantom(target_phantom, facade.GetCheckSum()));
+                params.destinations.push_back(seed_index + 1);
+            }
+            if (!params.IsValid())
+            {
+                util::Log(logERROR) << "Strict endpoint oracle table parameters are invalid.";
+                return false;
+            }
+
+            json::Object table_json;
+            const auto status = osrm.Table(params, table_json);
+            if (status != Status::Ok || !table_json.values.contains("durations"))
+            {
+                util::Log(logERROR) << "Strict endpoint oracle table query failed.";
+                return false;
+            }
+
+            const auto &durations_rows = std::get<json::Array>(table_json.values.at("durations")).values;
+            if (durations_rows.size() != 1)
+            {
+                util::Log(logERROR) << "Strict endpoint oracle expected one source row.";
+                return false;
+            }
+            const auto &row = std::get<json::Array>(durations_rows.front()).values;
+            if (row.size() != seed_endpoints.size())
+            {
+                util::Log(logERROR) << "Strict endpoint oracle column count mismatch.";
+                return false;
+            }
+
+            ticks_by_seed.assign(seed_endpoints.size(), std::nullopt);
+            reachable = false;
+            best_ticks = 0;
+            for (const auto seed_index : util::irange<std::size_t>(0, row.size()))
+            {
+                bool seed_reachable = false;
+                std::int64_t ticks = 0;
+                if (!extractDurationTicks(row[seed_index], seed_reachable, ticks))
+                {
+                    return false;
+                }
+                if (!seed_reachable)
+                {
+                    continue;
+                }
+                ticks_by_seed[seed_index] = ticks;
+                if (!reachable || ticks < best_ticks)
+                {
+                    reachable = true;
+                    best_ticks = ticks;
+                }
+            }
+            return true;
+        };
+
+        std::vector<std::optional<std::int64_t>> strict_ticks_by_seed;
+        bool strict_reachable = false;
+        std::int64_t strict_best_ticks = 0;
+        if (!run_table_for_source(
+                source_phantom, false, strict_ticks_by_seed, strict_reachable, strict_best_ticks))
+        {
+            return false;
+        }
+
+        std::vector<std::optional<std::int64_t>> state_base_ticks_by_seed;
+        bool state_base_reachable = false;
+        std::int64_t state_base_best_ticks = 0;
+        const auto state_source_phantom =
+            makeZeroStateOffsetPhantom(source_phantom, trace.chosen_state_forward);
+        if (!run_table_for_source(state_source_phantom,
+                                  true,
+                                  state_base_ticks_by_seed,
+                                  state_base_reachable,
+                                  state_base_best_ticks))
+        {
+            return false;
+        }
+
+        std::vector<std::optional<std::int64_t>> state_ticks_by_seed(seed_endpoints.size(), std::nullopt);
+        bool state_oracle_reachable = false;
+        std::int64_t state_oracle_best_ticks = 0;
+        for (const auto seed_index : util::irange<std::size_t>(0, seed_endpoints.size()))
+        {
+            if (!state_base_ticks_by_seed[seed_index].has_value())
+            {
+                continue;
+            }
+            const auto seed_offset = from_alias<std::int64_t>(seed_endpoints[seed_index].seed_offset);
+            const auto base_ticks = state_base_ticks_by_seed[seed_index].value();
+            const auto combined_ticks = base_ticks + seed_offset;
+            state_ticks_by_seed[seed_index] = combined_ticks;
+            if (!state_oracle_reachable || combined_ticks < state_oracle_best_ticks)
+            {
+                state_oracle_reachable = true;
+                state_oracle_best_ticks = combined_ticks;
+            }
+        }
+
+        ++stats.compared_samples;
+        const auto raster_reachable = sample_costs[sample_index] != INVALID_EDGE_WEIGHT;
+        bool strict_mismatch = false;
+        std::int64_t strict_delta_ticks = 0;
+        std::int64_t strict_abs_ticks = 0;
+        std::string reason = "ok";
+        if (!raster_reachable && !strict_reachable)
+        {
+            ++stats.unreachable_pairs;
+        }
+        else if (!raster_reachable && strict_reachable)
+        {
+            strict_mismatch = true;
+            reason = "raster_unreachable_strict_reachable";
+        }
+        else if (raster_reachable && !strict_reachable)
+        {
+            strict_mismatch = true;
+            reason = "raster_reachable_strict_unreachable";
+        }
+        else
+        {
+            ++stats.reachable_pairs;
+            strict_delta_ticks = from_alias<std::int64_t>(sample_costs[sample_index]) - strict_best_ticks;
+            strict_abs_ticks = std::llabs(strict_delta_ticks);
+            strict_deltas.push_back(strict_delta_ticks);
+            if (strict_abs_ticks > tolerance_ticks)
+            {
+                strict_mismatch = true;
+                reason = "abs_error_exceeds_tolerance";
+            }
+            stats.max_abs_error_ticks = std::max(stats.max_abs_error_ticks, strict_abs_ticks);
+        }
+
+        ++stats.state_compared_samples;
+        bool state_reachable = state_oracle_reachable;
+        bool state_mismatch = false;
+        std::int64_t state_delta_ticks = 0;
+        std::int64_t state_abs_ticks = 0;
+        const auto phast_state_reachable =
+            trace.chosen_state_cost != INVALID_EDGE_WEIGHT;
+
+        if (!phast_state_reachable && !state_reachable)
+        {
+            ++stats.state_unreachable_pairs;
+        }
+        else if (!phast_state_reachable && state_reachable)
+        {
+            state_mismatch = true;
+        }
+        else if (phast_state_reachable && !state_reachable)
+        {
+            state_mismatch = true;
+        }
+        else
+        {
+            ++stats.state_reachable_pairs;
+            const auto phast_state_ticks = from_alias<std::int64_t>(trace.chosen_state_cost);
+            state_delta_ticks = phast_state_ticks - state_oracle_best_ticks;
+            state_abs_ticks = std::llabs(state_delta_ticks);
+            state_deltas.push_back(state_delta_ticks);
+            if (state_abs_ticks > tolerance_ticks)
+            {
+                state_mismatch = true;
+            }
+            stats.state_max_abs_error_ticks = std::max(stats.state_max_abs_error_ticks, state_abs_ticks);
+        }
+        if (state_mismatch)
+        {
+            ++stats.state_mismatches;
+        }
+        if (strict_mismatch && !state_mismatch)
+        {
+            ++stats.endpoint_semantics_mismatch_samples;
+        }
+
+        if (coordinate_mismatch_samples.contains(sample_index) && !strict_mismatch)
+        {
+            ++stats.coordinate_mismatches_resolved;
+        }
+        if (strict_mismatch)
+        {
+            ++stats.mismatches;
+            if (logged_mismatch_traces < trace_limit)
+            {
+                util::Log(logERROR)
+                    << "Strict endpoint mismatch: sample_index=" << sample.sample_index
+                    << ", h3_id=" << sample.h3_id << ", reason=" << reason
+                    << ", strict_delta_ticks=" << strict_delta_ticks
+                    << ", state_delta_ticks=" << state_delta_ticks;
+                util::Log(logERROR) << "  strict_seed_ticks="
+                                    << formatStrictSeedTicks(strict_ticks_by_seed, seed_endpoints);
+                util::Log(logERROR) << "  state_seed_ticks="
+                                    << formatStrictSeedTicks(state_ticks_by_seed, seed_endpoints);
+                ++logged_mismatch_traces;
+            }
+        }
+        else if (logged_pass_traces < std::min<std::size_t>(trace_limit, 2))
+        {
+            util::Log() << "Strict endpoint pass: sample_index=" << sample.sample_index
+                        << ", h3_id=" << sample.h3_id
+                        << ", strict_delta_ticks=" << strict_delta_ticks
+                        << ", state_delta_ticks=" << state_delta_ticks;
+            util::Log() << "  strict_seed_ticks="
+                        << formatStrictSeedTicks(strict_ticks_by_seed, seed_endpoints);
+            util::Log() << "  state_seed_ticks="
+                        << formatStrictSeedTicks(state_ticks_by_seed, seed_endpoints);
+            ++logged_pass_traces;
+        }
+    }
+
     return true;
+}
+
+void logDeltaBuckets(const std::string &label, const std::vector<std::int64_t> &deltas)
+{
+    if (deltas.empty())
+    {
+        util::Log() << label << " delta buckets: no reachable pairs";
+        return;
+    }
+
+    std::size_t negative = 0;
+    std::size_t zero = 0;
+    std::size_t positive = 0;
+    std::size_t bucket_0_15 = 0;
+    std::size_t bucket_16_30 = 0;
+    std::size_t bucket_31_60 = 0;
+    std::size_t bucket_61_120 = 0;
+    std::size_t bucket_121_300 = 0;
+    std::size_t bucket_301_600 = 0;
+    std::size_t bucket_601_plus = 0;
+    for (const auto delta : deltas)
+    {
+        if (delta < 0)
+        {
+            ++negative;
+        }
+        else if (delta > 0)
+        {
+            ++positive;
+        }
+        else
+        {
+            ++zero;
+        }
+
+        const auto abs_delta = std::llabs(delta);
+        if (abs_delta <= 15)
+        {
+            ++bucket_0_15;
+        }
+        else if (abs_delta <= 30)
+        {
+            ++bucket_16_30;
+        }
+        else if (abs_delta <= 60)
+        {
+            ++bucket_31_60;
+        }
+        else if (abs_delta <= 120)
+        {
+            ++bucket_61_120;
+        }
+        else if (abs_delta <= 300)
+        {
+            ++bucket_121_300;
+        }
+        else if (abs_delta <= 600)
+        {
+            ++bucket_301_600;
+        }
+        else
+        {
+            ++bucket_601_plus;
+        }
+    }
+
+    util::Log() << label << " delta sign: negative=" << negative << ", zero=" << zero
+                << ", positive=" << positive;
+    util::Log() << label << " abs(delta) buckets: [0..15]=" << bucket_0_15
+                << ", [16..30]=" << bucket_16_30 << ", [31..60]=" << bucket_31_60
+                << ", [61..120]=" << bucket_61_120 << ", [121..300]=" << bucket_121_300
+                << ", [301..600]=" << bucket_301_600 << ", [601+]=" << bucket_601_plus;
 }
 
 bool mapSampleToCost(const CHDataFacade &facade,
@@ -934,14 +1772,18 @@ bool mapSampleToCost(const CHDataFacade &facade,
                      const PHASTOrientation orientation,
                      const std::vector<EdgeWeight> &costs,
                      EdgeWeight &mapped_cost,
-                     RasterizationStats &stats)
+                     RasterizationStats &stats,
+                     SampleMappingTrace &trace)
 {
+    trace = {};
     mapped_cost = INVALID_EDGE_WEIGHT;
     auto candidates = facade.NearestPhantomNodes(sample.coordinate,
                                                  MAX_SNAP_CANDIDATES,
                                                  std::nullopt,
                                                  std::nullopt,
                                                  engine::Approach::UNRESTRICTED);
+    trace.has_snap_candidates = !candidates.empty();
+    trace.snap_candidate_count = candidates.size();
     if (candidates.empty())
     {
         ++stats.no_candidate_samples;
@@ -1006,6 +1848,11 @@ bool mapSampleToCost(const CHDataFacade &facade,
     {
         const auto &phantom = candidates[candidate_index].phantom_node;
         EdgeWeight best_candidate_cost = INVALID_EDGE_WEIGHT;
+        NodeID best_candidate_state_node = SPECIAL_SEGMENTID;
+        bool best_candidate_state_forward = false;
+        EdgeWeight best_candidate_state_cost = INVALID_EDGE_WEIGHT;
+        EdgeWeight best_candidate_source_offset = INVALID_EDGE_WEIGHT;
+        bool best_candidate_has_state = false;
         bool candidate_has_valid_state = false;
         bool candidate_has_reachable_state = false;
 
@@ -1047,6 +1894,11 @@ bool mapSampleToCost(const CHDataFacade &facade,
             if (best_candidate_cost == INVALID_EDGE_WEIGHT || total_cost < best_candidate_cost)
             {
                 best_candidate_cost = total_cost;
+                best_candidate_state_node = node_id;
+                best_candidate_state_forward = forward_state;
+                best_candidate_state_cost = state_cost;
+                best_candidate_source_offset = source_offset;
+                best_candidate_has_state = true;
             }
             return true;
         };
@@ -1066,6 +1918,20 @@ bool mapSampleToCost(const CHDataFacade &facade,
         }
 
         mapped_cost = best_candidate_cost;
+        trace.chosen_candidate_index = candidate_index;
+        trace.chosen_forward_segment_id = phantom.forward_segment_id.id;
+        trace.chosen_forward_segment_enabled = phantom.forward_segment_id.enabled;
+        trace.chosen_reverse_segment_id = phantom.reverse_segment_id.id;
+        trace.chosen_reverse_segment_enabled = phantom.reverse_segment_id.enabled;
+        if (best_candidate_has_state)
+        {
+            trace.has_chosen_state = true;
+            trace.chosen_state_node_id = best_candidate_state_node;
+            trace.chosen_state_forward = best_candidate_state_forward;
+            trace.chosen_state_cost = best_candidate_state_cost;
+            trace.chosen_source_offset = best_candidate_source_offset;
+            trace.chosen_total_cost = best_candidate_cost;
+        }
         if (candidate_index > 0)
         {
             ++stats.fallback_candidate_used_samples;
@@ -1096,10 +1962,12 @@ bool rasterizeToCells(const CHDataFacade &facade,
                       const std::vector<EdgeWeight> &costs,
                       std::unordered_map<std::string, CellAggregate> &cells,
                       std::vector<EdgeWeight> &sample_costs,
+                      std::vector<SampleMappingTrace> &sample_traces,
                       RasterizationStats &stats)
 {
     cells.clear();
     sample_costs.assign(samples.size(), INVALID_EDGE_WEIGHT);
+    sample_traces.assign(samples.size(), SampleMappingTrace{});
     stats = {};
     if (costs.empty())
     {
@@ -1111,7 +1979,8 @@ bool rasterizeToCells(const CHDataFacade &facade,
     {
         const auto &sample = samples[sample_index];
         EdgeWeight mapped_cost = INVALID_EDGE_WEIGHT;
-        if (!mapSampleToCost(facade, sample, metric_kind, orientation, costs, mapped_cost, stats))
+        if (!mapSampleToCost(
+                facade, sample, metric_kind, orientation, costs, mapped_cost, stats, sample_traces[sample_index]))
         {
             return false;
         }
@@ -1233,6 +2102,11 @@ try
                             ? std::string("all")
                             : std::to_string(runtime_config.oracle_max_samples));
         util::Log() << "Oracle tolerance (ticks): " << runtime_config.oracle_tolerance_ticks;
+        util::Log() << "Oracle trace limit: " << runtime_config.oracle_trace_limit;
+        util::Log() << "Oracle strict endpoints: "
+                    << (runtime_config.oracle_strict_endpoints ? "yes" : "no");
+        util::Log() << "Oracle report all comparisons: "
+                    << (runtime_config.oracle_report_all ? "yes" : "no");
         if (!runtime_config.oracle_mismatch_report_path.empty())
         {
             util::Log() << "Oracle mismatch report: "
@@ -1278,6 +2152,7 @@ try
 
     std::unordered_map<std::string, CellAggregate> cells;
     std::vector<EdgeWeight> sample_costs;
+    std::vector<SampleMappingTrace> sample_traces;
     RasterizationStats rasterization_stats;
     if (!rasterizeToCells(*facade,
                           samples,
@@ -1286,17 +2161,24 @@ try
                           field_data.costs,
                           cells,
                           sample_costs,
+                          sample_traces,
                           rasterization_stats))
     {
         return EXIT_FAILURE;
     }
 
+    bool oracle_failed = false;
     if (runtime_config.oracle_enabled)
     {
         if (field_data.metric_kind != MetricKind::Duration)
         {
             util::Log(logERROR)
                 << "Oracle mode is only supported for duration metric phastfield artifacts.";
+            return EXIT_FAILURE;
+        }
+        if (runtime_config.oracle_report_all && runtime_config.oracle_mismatch_report_path.empty())
+        {
+            util::Log(logERROR) << "--oracle-report-all requires --oracle-mismatch-report.";
             return EXIT_FAILURE;
         }
 
@@ -1308,15 +2190,20 @@ try
         util::Log() << "Loaded oracle POIs: " << oracle_pois.size();
 
         OracleStats oracle_stats;
+        std::vector<OracleComparison> oracle_comparisons;
         if (!runDurationOracle(rasterize_config.base_path,
                                field_data.orientation,
                                samples,
                                sample_costs,
+                               sample_traces,
                                oracle_pois,
                                runtime_config.oracle_max_samples,
                                runtime_config.oracle_tolerance_ticks,
                                runtime_config.oracle_mismatch_report_path,
-                               oracle_stats))
+                               runtime_config.oracle_report_all,
+                               runtime_config.oracle_trace_limit,
+                               oracle_stats,
+                               oracle_comparisons))
         {
             return EXIT_FAILURE;
         }
@@ -1324,6 +2211,68 @@ try
         util::Log() << "Oracle reachable sample pairs: " << oracle_stats.reachable_pairs;
         util::Log() << "Oracle unreachable sample pairs: " << oracle_stats.unreachable_pairs;
         util::Log() << "Oracle max abs error (ticks): " << oracle_stats.max_abs_error_ticks;
+
+        std::vector<std::int64_t> coordinate_deltas;
+        coordinate_deltas.reserve(oracle_comparisons.size());
+        for (const auto &comparison : oracle_comparisons)
+        {
+            if (comparison.raster_reachable && comparison.oracle_reachable)
+            {
+                coordinate_deltas.push_back(comparison.delta_ticks);
+            }
+        }
+        logDeltaBuckets("Coordinate oracle", coordinate_deltas);
+
+        if (runtime_config.oracle_strict_endpoints)
+        {
+            StrictOracleStats strict_stats;
+            std::vector<std::int64_t> strict_deltas;
+            std::vector<std::int64_t> state_deltas;
+            if (!runStrictEndpointOracle(rasterize_config.base_path,
+                                         *facade,
+                                         field_data.orientation,
+                                         samples,
+                                         sample_costs,
+                                         sample_traces,
+                                         oracle_pois,
+                                         oracle_comparisons,
+                                         runtime_config.oracle_tolerance_ticks,
+                                         runtime_config.oracle_trace_limit,
+                                         strict_stats,
+                                         strict_deltas,
+                                         state_deltas))
+            {
+                return EXIT_FAILURE;
+            }
+            util::Log() << "Strict endpoint compared samples: " << strict_stats.compared_samples;
+            util::Log() << "Strict endpoint reachable sample pairs: " << strict_stats.reachable_pairs;
+            util::Log() << "Strict endpoint unreachable sample pairs: " << strict_stats.unreachable_pairs;
+            util::Log() << "Strict endpoint mismatches: " << strict_stats.mismatches;
+            util::Log() << "Strict endpoint max abs error (ticks): " << strict_stats.max_abs_error_ticks;
+            util::Log() << "Coordinate mismatches resolved by strict endpoint oracle: "
+                        << strict_stats.coordinate_mismatches_resolved;
+            logDeltaBuckets("Strict endpoint oracle", strict_deltas);
+            util::Log() << "Graph-state oracle compared samples: " << strict_stats.state_compared_samples;
+            util::Log() << "Graph-state oracle reachable sample pairs: "
+                        << strict_stats.state_reachable_pairs;
+            util::Log() << "Graph-state oracle unreachable sample pairs: "
+                        << strict_stats.state_unreachable_pairs;
+            util::Log() << "Graph-state oracle mismatches: " << strict_stats.state_mismatches;
+            util::Log() << "Graph-state oracle max abs error (ticks): "
+                        << strict_stats.state_max_abs_error_ticks;
+            util::Log() << "Endpoint-semantics-only mismatches (strict mismatch, graph-state pass): "
+                        << strict_stats.endpoint_semantics_mismatch_samples;
+            logDeltaBuckets("Graph-state oracle", state_deltas);
+        }
+
+        if (oracle_stats.mismatches > 0)
+        {
+            util::Log(logERROR) << "Coordinate oracle mismatches: " << oracle_stats.mismatches
+                                << " of " << oracle_stats.compared_samples
+                                << " compared samples (tolerance "
+                                << runtime_config.oracle_tolerance_ticks << " ticks).";
+            oracle_failed = true;
+        }
     }
 
     std::size_t reachable_cells = 0;
@@ -1350,6 +2299,10 @@ try
     util::Log() << "PHAST rasterization prototype complete.";
 
     util::DumpMemoryStats();
+    if (oracle_failed)
+    {
+        return EXIT_FAILURE;
+    }
     return EXIT_SUCCESS;
 }
 catch (const osrm::RuntimeError &e)
