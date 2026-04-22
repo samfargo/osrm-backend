@@ -761,7 +761,40 @@ bool writeDenseU16Artifact(const std::filesystem::path &output_path,
     {
         ids.push_back(pair.first);
     }
-    std::sort(ids.begin(), ids.end());
+    auto parse_h3_id = [](const std::string &text, std::uint64_t &parsed) -> bool
+    {
+        if (text.empty())
+        {
+            return false;
+        }
+        try
+        {
+            std::size_t consumed = 0;
+            const auto value = std::stoull(text, &consumed, 10);
+            if (consumed != text.size())
+            {
+                return false;
+            }
+            parsed = static_cast<std::uint64_t>(value);
+            return true;
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
+    };
+    std::sort(ids.begin(), ids.end(), [&](const std::string &lhs, const std::string &rhs)
+              {
+                  std::uint64_t lhs_value = 0;
+                  std::uint64_t rhs_value = 0;
+                  const bool lhs_ok = parse_h3_id(lhs, lhs_value);
+                  const bool rhs_ok = parse_h3_id(rhs, rhs_value);
+                  if (lhs_ok && rhs_ok && lhs_value != rhs_value)
+                  {
+                      return lhs_value < rhs_value;
+                  }
+                  return lhs < rhs;
+              });
 
     std::vector<std::uint16_t> encoded;
     encoded.reserve(ids.size());
