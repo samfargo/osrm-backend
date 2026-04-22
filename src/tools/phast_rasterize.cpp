@@ -18,18 +18,19 @@
 #include <boost/program_options.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -111,6 +112,7 @@ struct RasterizationStats
     std::size_t no_candidate_samples = 0;
     std::size_t no_valid_state_samples = 0;
     std::size_t unreachable_state_samples = 0;
+    std::size_t capped_samples = 0;
 };
 
 using CHDataFacade =
@@ -166,7 +168,7 @@ parseArguments(int argc,
         "CSV file with rows: h3_id,res,sample_index,lon,lat")(
         "output",
         boost::program_options::value<std::filesystem::path>(&runtime_config.output_path),
-        "Output CSV path for per-cell costs")(
+        "Output dense little-endian uint16 artifact path (.u16)")(
         "resolution",
         boost::program_options::value<std::uint32_t>(&runtime_config.expected_resolution)
             ->default_value(9),
@@ -691,6 +693,7 @@ bool rasterizeToCells(const CHDataFacade &facade,
                       const std::vector<SamplePoint> &samples,
                       const MetricKind metric_kind,
                       const PHASTOrientation orientation,
+                      const std::optional<EdgeWeight> cap_metric,
                       const std::vector<EdgeWeight> &costs,
                       std::unordered_map<std::string, CellAggregate> &cells,
                       RasterizationStats &stats)
@@ -727,6 +730,11 @@ bool rasterizeToCells(const CHDataFacade &facade,
         {
             continue;
         }
+        if (cap_metric.has_value() && mapped_cost > cap_metric.value())
+        {
+            ++stats.capped_samples;
+            continue;
+        }
         ++cell.reachable_count;
         if (cell.min_cost == INVALID_EDGE_WEIGHT || mapped_cost < cell.min_cost)
         {
@@ -737,18 +745,15 @@ bool rasterizeToCells(const CHDataFacade &facade,
     return !cells.empty();
 }
 
-bool writeCellCostArtifact(const std::filesystem::path &output_path,
+bool writeDenseU16Artifact(const std::filesystem::path &output_path,
                            const std::string &metric_name,
                            const std::unordered_map<std::string, CellAggregate> &cells,
                            std::size_t &reachable_cells,
-                           std::size_t &unreachable_cells)
+                           std::size_t &unreachable_cells,
+                           std::size_t &bytes_written)
 {
-    std::ofstream output(output_path);
-    if (!output)
-    {
-        util::Log(logERROR) << "Could not open output artifact path: " << output_path.string();
-        return false;
-    }
+    constexpr std::uint16_t MAX_REACHABLE_U16_INT = 65534;
+    constexpr std::uint16_t UNREACHABLE_U16_INT = 65535;
 
     std::vector<std::string> ids;
     ids.reserve(cells.size());
@@ -758,30 +763,137 @@ bool writeCellCostArtifact(const std::filesystem::path &output_path,
     }
     std::sort(ids.begin(), ids.end());
 
-    output << "h3_id,res,sample_count,reachable_samples,cost_ticks,cost_seconds\n";
+    std::vector<std::uint16_t> encoded;
+    encoded.reserve(ids.size());
 
     reachable_cells = 0;
     unreachable_cells = 0;
     for (const auto &h3_id : ids)
     {
         const auto &cell = cells.at(h3_id);
-        output << h3_id << "," << cell.res << "," << cell.sample_count << "," << cell.reachable_count
-               << ",";
         if (cell.min_cost == INVALID_EDGE_WEIGHT)
         {
             ++unreachable_cells;
-            output << ",\n";
+            encoded.push_back(UNREACHABLE_U16_INT);
             continue;
         }
 
-        ++reachable_cells;
         const auto ticks = from_alias<std::int64_t>(cell.min_cost);
-        output << ticks << ",";
+        double seconds = static_cast<double>(ticks);
         if (metric_name == "duration")
         {
-            output << std::fixed << std::setprecision(1) << (ticks / 10.0);
+            seconds = ticks / 10.0;
         }
-        output << "\n";
+        const auto rounded = std::nearbyint(seconds);
+        if (!std::isfinite(rounded) || rounded < 0.0)
+        {
+            ++unreachable_cells;
+            encoded.push_back(UNREACHABLE_U16_INT);
+            continue;
+        }
+        const auto clipped = std::min<double>(rounded, static_cast<double>(MAX_REACHABLE_U16_INT));
+        encoded.push_back(static_cast<std::uint16_t>(clipped));
+        ++reachable_cells;
+    }
+
+    auto output_tmp = output_path;
+    output_tmp += ".tmp";
+    std::ofstream output(output_tmp, std::ios::binary | std::ios::trunc);
+    if (!output)
+    {
+        util::Log(logERROR) << "Could not open output artifact path: " << output_tmp.string();
+        return false;
+    }
+    for (const auto value : encoded)
+    {
+        const char bytes[2] = {
+            static_cast<char>(value & 0xFF),
+            static_cast<char>((value >> 8) & 0xFF),
+        };
+        output.write(bytes, sizeof(bytes));
+        if (!output.good())
+        {
+            util::Log(logERROR) << "Failed writing raster artifact bytes: " << output_tmp.string();
+            return false;
+        }
+    }
+    output.close();
+    if (!output)
+    {
+        util::Log(logERROR) << "Failed flushing raster artifact: " << output_tmp.string();
+        return false;
+    }
+
+    bytes_written = encoded.size() * sizeof(std::uint16_t);
+    std::error_code remove_error;
+    std::filesystem::remove(output_path, remove_error);
+    (void)remove_error;
+    std::error_code rename_error;
+    std::filesystem::rename(output_tmp, output_path, rename_error);
+    if (rename_error)
+    {
+        util::Log(logERROR) << "Failed to finalize raster artifact " << output_path.string()
+                            << ": " << rename_error.message();
+        std::error_code cleanup_error;
+        std::filesystem::remove(output_tmp, cleanup_error);
+        (void)cleanup_error;
+        return false;
+    }
+
+    return true;
+}
+
+bool writeStatsMetadata(const std::filesystem::path &output_path,
+                        const std::size_t cell_count,
+                        const std::size_t reachable_cells,
+                        const std::size_t unreachable_cells,
+                        const std::size_t bytes_written,
+                        const RasterizationStats &rasterization_stats)
+{
+    auto metadata_path = output_path;
+    metadata_path += ".meta.json";
+    auto metadata_tmp = metadata_path;
+    metadata_tmp += ".tmp";
+
+    std::ofstream metadata(metadata_tmp, std::ios::trunc);
+    if (!metadata)
+    {
+        util::Log(logERROR) << "Could not open raster metadata path: " << metadata_tmp.string();
+        return false;
+    }
+    metadata << "{"
+             << "\"cells_total\":" << cell_count << ","
+             << "\"reachable_cells\":" << reachable_cells << ","
+             << "\"unreachable_cells\":" << unreachable_cells << ","
+             << "\"bytes\":" << bytes_written << ","
+             << "\"mapped_samples\":" << rasterization_stats.mapped_samples << ","
+             << "\"fallback_candidate_used_samples\":"
+             << rasterization_stats.fallback_candidate_used_samples << ","
+             << "\"no_candidate_samples\":" << rasterization_stats.no_candidate_samples << ","
+             << "\"no_valid_state_samples\":" << rasterization_stats.no_valid_state_samples << ","
+             << "\"unreachable_state_samples\":" << rasterization_stats.unreachable_state_samples << ","
+             << "\"capped_samples\":" << rasterization_stats.capped_samples
+             << "}\n";
+    metadata.close();
+    if (!metadata)
+    {
+        util::Log(logERROR) << "Failed flushing raster metadata: " << metadata_tmp.string();
+        return false;
+    }
+
+    std::error_code remove_error;
+    std::filesystem::remove(metadata_path, remove_error);
+    (void)remove_error;
+    std::error_code rename_error;
+    std::filesystem::rename(metadata_tmp, metadata_path, rename_error);
+    if (rename_error)
+    {
+        util::Log(logERROR) << "Failed to finalize raster metadata " << metadata_path.string()
+                            << ": " << rename_error.message();
+        std::error_code cleanup_error;
+        std::filesystem::remove(metadata_tmp, cleanup_error);
+        (void)cleanup_error;
+        return false;
     }
 
     return true;
@@ -817,7 +929,7 @@ try
     util::Log() << "Input file: " << rasterize_config.base_path.string() << ".osrm";
     util::Log() << "Phastfield: " << runtime_config.phastfield_path.string();
     util::Log() << "Sample file: " << runtime_config.sample_file_path.string();
-    util::Log() << "Output artifact: " << runtime_config.output_path.string();
+    util::Log() << "Output artifact (.u16): " << runtime_config.output_path.string();
     util::Log() << "Expected H3 resolution: " << runtime_config.expected_resolution;
 
     extractor::ProfileProperties properties;
@@ -835,6 +947,19 @@ try
     util::Log() << "Phastfield POI count: " << field_data.poi_count;
     util::Log() << "Phastfield orientation: "
                 << (field_data.orientation == PHASTOrientation::Reverse ? "reverse" : "forward");
+    std::optional<EdgeWeight> cap_metric = std::nullopt;
+    if (field_data.cap_metric != std::numeric_limits<std::uint32_t>::max())
+    {
+        const auto cap_ticks = static_cast<std::int64_t>(field_data.cap_metric);
+        const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+        if (cap_ticks < 0 || cap_ticks > max_valid)
+        {
+            util::Log(logERROR) << "Invalid cap_metric in phastfield metadata.";
+            return EXIT_FAILURE;
+        }
+        cap_metric = to_alias<EdgeWeight>(cap_ticks);
+        util::Log() << "Phastfield cap metric: " << cap_ticks << " ticks";
+    }
 
     std::shared_ptr<const CHDataFacade> facade;
     if (!loadCHFacade(rasterize_config.base_path,
@@ -862,6 +987,7 @@ try
                           samples,
                           field_data.metric_kind,
                           field_data.orientation,
+                          cap_metric,
                           field_data.costs,
                           cells,
                           rasterization_stats))
@@ -871,11 +997,22 @@ try
 
     std::size_t reachable_cells = 0;
     std::size_t unreachable_cells = 0;
-    if (!writeCellCostArtifact(runtime_config.output_path,
+    std::size_t bytes_written = 0;
+    if (!writeDenseU16Artifact(runtime_config.output_path,
                                field_data.metric_name,
                                cells,
                                reachable_cells,
-                               unreachable_cells))
+                               unreachable_cells,
+                               bytes_written))
+    {
+        return EXIT_FAILURE;
+    }
+    if (!writeStatsMetadata(runtime_config.output_path,
+                            cells.size(),
+                            reachable_cells,
+                            unreachable_cells,
+                            bytes_written,
+                            rasterization_stats))
     {
         return EXIT_FAILURE;
     }
@@ -884,13 +1021,15 @@ try
     util::Log() << "Reachable cells: " << reachable_cells;
     util::Log() << "Unreachable cells: " << unreachable_cells;
     util::Log() << "Mapped samples: " << rasterization_stats.mapped_samples;
+    util::Log() << "Capped samples: " << rasterization_stats.capped_samples;
     util::Log() << "Fallback snap candidate used: "
                 << rasterization_stats.fallback_candidate_used_samples;
     util::Log() << "Samples with no snap candidates: " << rasterization_stats.no_candidate_samples;
     util::Log() << "Samples with no valid start states: " << rasterization_stats.no_valid_state_samples;
     util::Log() << "Samples with valid states but unreachable field values: "
                 << rasterization_stats.unreachable_state_samples;
-    util::Log() << "PHAST rasterization prototype complete.";
+    util::Log() << "Output bytes: " << bytes_written;
+    util::Log() << "PHAST rasterization complete.";
 
     util::DumpMemoryStats();
     return EXIT_SUCCESS;
