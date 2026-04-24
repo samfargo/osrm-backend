@@ -68,7 +68,6 @@ struct SamplePrimaryHint
 struct RasterizationStats
 {
     std::size_t mapped_samples = 0;
-    std::size_t fallback_candidate_used_samples = 0;
     std::size_t no_candidate_samples = 0;
     std::size_t no_valid_state_samples = 0;
     std::size_t unreachable_state_samples = 0;
@@ -350,8 +349,6 @@ bool writeStatsMetadata(const std::filesystem::path &output_path,
              << "\"unreachable_cells\":" << unreachable_cells << ","
              << "\"bytes\":" << bytes_written << ","
              << "\"mapped_samples\":" << rasterization_stats.mapped_samples << ","
-             << "\"fallback_candidate_used_samples\":"
-             << rasterization_stats.fallback_candidate_used_samples << ","
              << "\"no_candidate_samples\":" << rasterization_stats.no_candidate_samples << ","
              << "\"no_valid_state_samples\":" << rasterization_stats.no_valid_state_samples << ","
              << "\"unreachable_state_samples\":" << rasterization_stats.unreachable_state_samples << ","
