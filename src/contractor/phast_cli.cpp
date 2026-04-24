@@ -63,7 +63,20 @@ ReturnCode ParseArguments(int argc,
         "Output format: phastfield-v1|raw-u32")(
         "output",
         boost::program_options::value<std::filesystem::path>(&runtime_config.output_path),
-        "Output path (default: <input>.phastfield or <input>.phastfield.raw_u32)");
+        "Output path (default: <input>.phastfield or <input>.phastfield.raw_u32)")(
+        "sample-file",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.sample_file),
+        "CSV file with rows: h3_id,res,sample_index,lon,lat")(
+        "sample-snap-cache",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.sample_snap_cache),
+        "Primary snap cache file for sample points")(
+        "raster-output",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.raster_output_path),
+        "Output dense little-endian uint16 artifact path (.u16)")(
+        "resolution",
+        boost::program_options::value<std::uint32_t>(&runtime_config.expected_resolution)
+            ->default_value(9),
+        "Expected H3 resolution in sample file/cache (default 9)");
 
     boost::program_options::options_description hidden_options("Hidden options");
     hidden_options.add_options()(
@@ -160,6 +173,18 @@ ReturnCode ParseArguments(int argc,
     {
         runtime_config.has_output_path = true;
     }
+    if (option_variables.contains("sample-file"))
+    {
+        runtime_config.has_sample_file = true;
+    }
+    if (option_variables.contains("sample-snap-cache"))
+    {
+        runtime_config.has_sample_snap_cache = true;
+    }
+    if (option_variables.contains("raster-output"))
+    {
+        runtime_config.has_raster_output_path = true;
+    }
 
     const bool has_manual_seeds = !runtime_config.seed_nodes.empty() || runtime_config.has_seed_file;
     if (has_manual_seeds == runtime_config.has_poi_file)
@@ -199,6 +224,25 @@ ReturnCode ParseArguments(int argc,
         if (runtime_config.orientation != "forward" && runtime_config.orientation != "reverse")
         {
             util::Log(logERROR) << "--orientation must be 'forward' or 'reverse'.";
+            return ReturnCode::Fail;
+        }
+    }
+    if (runtime_config.expected_resolution == 0)
+    {
+        util::Log(logERROR) << "--resolution must be > 0.";
+        return ReturnCode::Fail;
+    }
+    if (runtime_config.has_raster_output_path)
+    {
+        if (runtime_config.has_output_path)
+        {
+            util::Log(logERROR) << "Specify only one of --output or --raster-output.";
+            return ReturnCode::Fail;
+        }
+        if (!runtime_config.has_sample_file || !runtime_config.has_sample_snap_cache)
+        {
+            util::Log(logERROR)
+                << "--raster-output requires both --sample-file and --sample-snap-cache.";
             return ReturnCode::Fail;
         }
     }

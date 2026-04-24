@@ -12,19 +12,472 @@
 #include "osrm/exception.hpp"
 
 #include "util/exception.hpp"
+#include "util/integer_range.hpp"
 #include "util/log.hpp"
 #include "util/meminfo.hpp"
 
+#include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
 using namespace osrm;
+
+namespace
+{
+constexpr std::uint32_t SAMPLE_SNAP_CACHE_VERSION = 1;
+constexpr std::array<char, 8> SAMPLE_SNAP_CACHE_MAGIC = {'P', 'H', 'S', 'N', 'A', 'P', '1', '\0'};
+constexpr std::uint16_t MAX_REACHABLE_U16_INT = 65534;
+constexpr std::uint16_t UNREACHABLE_U16_INT = 65535;
+
+struct SampleSnapCacheHeader
+{
+    std::uint32_t version = SAMPLE_SNAP_CACHE_VERSION;
+    std::uint32_t connectivity_checksum = 0;
+    std::uint32_t expected_resolution = 0;
+    std::uint32_t reserved = 0;
+    std::uint64_t sample_count = 0;
+    std::uint64_t sample_file_size = 0;
+    std::int64_t sample_file_mtime_ticks = 0;
+};
+
+struct SamplePrimaryHint
+{
+    bool has_forward_state = false;
+    bool forward_offset_valid = false;
+    std::uint32_t forward_node_id = 0;
+    EdgeWeight forward_offset = INVALID_EDGE_WEIGHT;
+
+    bool has_reverse_state = false;
+    bool reverse_offset_valid = false;
+    std::uint32_t reverse_node_id = 0;
+    EdgeWeight reverse_offset = INVALID_EDGE_WEIGHT;
+};
+
+struct RasterizationStats
+{
+    std::size_t mapped_samples = 0;
+    std::size_t fallback_candidate_used_samples = 0;
+    std::size_t no_candidate_samples = 0;
+    std::size_t no_valid_state_samples = 0;
+    std::size_t unreachable_state_samples = 0;
+    std::size_t capped_samples = 0;
+};
+
+constexpr std::uint8_t SAMPLE_HINT_HAS_FORWARD = 1U << 0;
+constexpr std::uint8_t SAMPLE_HINT_FORWARD_OFFSET_VALID = 1U << 1;
+constexpr std::uint8_t SAMPLE_HINT_HAS_REVERSE = 1U << 2;
+constexpr std::uint8_t SAMPLE_HINT_REVERSE_OFFSET_VALID = 1U << 3;
+constexpr std::size_t SAMPLE_HINT_RECORD_BYTES = 28;
+
+template <typename T> bool writeBinary(std::ostream &output, const T &value)
+{
+    output.write(reinterpret_cast<const char *>(&value), sizeof(T));
+    return output.good();
+}
+
+template <typename T> bool readBinary(std::istream &input, T &value)
+{
+    input.read(reinterpret_cast<char *>(&value), sizeof(T));
+    return input.good();
+}
+
+bool readSnapCacheHeader(std::istream &input, SampleSnapCacheHeader &header)
+{
+    std::array<char, SAMPLE_SNAP_CACHE_MAGIC.size()> magic{};
+    if (!input.read(magic.data(), magic.size()))
+    {
+        return false;
+    }
+    if (magic != SAMPLE_SNAP_CACHE_MAGIC)
+    {
+        return false;
+    }
+    return readBinary(input, header.version) && readBinary(input, header.connectivity_checksum) &&
+           readBinary(input, header.expected_resolution) && readBinary(input, header.reserved) &&
+           readBinary(input, header.sample_count) && readBinary(input, header.sample_file_size) &&
+           readBinary(input, header.sample_file_mtime_ticks);
+}
+
+bool readPrimaryHintRecord(std::istream &input, SamplePrimaryHint &hint)
+{
+    std::int32_t ignored_lon = 0;
+    std::int32_t ignored_lat = 0;
+    std::int32_t forward_offset_ticks = 0;
+    std::int32_t reverse_offset_ticks = 0;
+    std::uint8_t flags = 0;
+    std::uint8_t reserved0 = 0;
+    std::uint16_t reserved1 = 0;
+
+    if (!readBinary(input, ignored_lon) || !readBinary(input, ignored_lat) ||
+        !readBinary(input, hint.forward_node_id) || !readBinary(input, hint.reverse_node_id) ||
+        !readBinary(input, forward_offset_ticks) || !readBinary(input, reverse_offset_ticks) ||
+        !readBinary(input, flags) || !readBinary(input, reserved0) || !readBinary(input, reserved1))
+    {
+        return false;
+    }
+
+    hint.has_forward_state = (flags & SAMPLE_HINT_HAS_FORWARD) != 0;
+    hint.forward_offset_valid = (flags & SAMPLE_HINT_FORWARD_OFFSET_VALID) != 0;
+    hint.has_reverse_state = (flags & SAMPLE_HINT_HAS_REVERSE) != 0;
+    hint.reverse_offset_valid = (flags & SAMPLE_HINT_REVERSE_OFFSET_VALID) != 0;
+    hint.forward_offset = to_alias<EdgeWeight>(static_cast<std::int64_t>(forward_offset_ticks));
+    hint.reverse_offset = to_alias<EdgeWeight>(static_cast<std::int64_t>(reverse_offset_ticks));
+    return true;
+}
+
+bool readSampleFileFingerprint(const std::filesystem::path &sample_file_path,
+                               std::uint64_t &sample_file_size,
+                               std::int64_t &sample_file_mtime_ticks)
+{
+    std::error_code size_error;
+    sample_file_size = std::filesystem::file_size(sample_file_path, size_error);
+    if (size_error)
+    {
+        util::Log(logERROR) << "Failed to read sample file size: " << sample_file_path.string()
+                            << " (" << size_error.message() << ")";
+        return false;
+    }
+
+    std::error_code mtime_error;
+    const auto mtime = std::filesystem::last_write_time(sample_file_path, mtime_error);
+    if (mtime_error)
+    {
+        util::Log(logERROR) << "Failed to read sample file mtime: " << sample_file_path.string()
+                            << " (" << mtime_error.message() << ")";
+        return false;
+    }
+    sample_file_mtime_ticks = static_cast<std::int64_t>(mtime.time_since_epoch().count());
+    return true;
+}
+
+bool tryAddCost(const EdgeWeight lhs, const EdgeWeight rhs, EdgeWeight &sum)
+{
+    if (lhs == INVALID_EDGE_WEIGHT || rhs == INVALID_EDGE_WEIGHT)
+    {
+        return false;
+    }
+    const auto total = from_alias<std::int64_t>(lhs) + from_alias<std::int64_t>(rhs);
+    const auto max_valid = from_alias<std::int64_t>(INVALID_EDGE_WEIGHT) - 1;
+    if (total < 0 || total > max_valid)
+    {
+        return false;
+    }
+    sum = to_alias<EdgeWeight>(total);
+    return true;
+}
+
+bool mapSampleFromPrimaryHint(const SamplePrimaryHint &hint,
+                              const std::vector<EdgeWeight> &costs,
+                              EdgeWeight &mapped_cost,
+                              RasterizationStats &stats)
+{
+    mapped_cost = INVALID_EDGE_WEIGHT;
+    EdgeWeight best_candidate_cost = INVALID_EDGE_WEIGHT;
+
+    bool any_valid_state = false;
+    bool any_reachable_state = false;
+    auto evaluate_hint_state = [&](const bool has_state,
+                                   const std::uint32_t node_id,
+                                   const bool offset_valid,
+                                   const EdgeWeight offset) -> bool
+    {
+        if (!has_state)
+        {
+            return true;
+        }
+        any_valid_state = true;
+        if (node_id >= costs.size())
+        {
+            util::Log(logERROR) << "Primary snap node id out of bounds: " << node_id;
+            return false;
+        }
+        const auto state_cost = costs[node_id];
+        if (state_cost == INVALID_EDGE_WEIGHT || !offset_valid)
+        {
+            return true;
+        }
+        any_reachable_state = true;
+        EdgeWeight total_cost = INVALID_EDGE_WEIGHT;
+        if (!tryAddCost(state_cost, offset, total_cost))
+        {
+            return true;
+        }
+        if (best_candidate_cost == INVALID_EDGE_WEIGHT || total_cost < best_candidate_cost)
+        {
+            best_candidate_cost = total_cost;
+        }
+        return true;
+    };
+
+    if (!evaluate_hint_state(
+            hint.has_forward_state, hint.forward_node_id, hint.forward_offset_valid, hint.forward_offset) ||
+        !evaluate_hint_state(
+            hint.has_reverse_state, hint.reverse_node_id, hint.reverse_offset_valid, hint.reverse_offset))
+    {
+        return false;
+    }
+
+    mapped_cost = best_candidate_cost;
+    if (mapped_cost != INVALID_EDGE_WEIGHT)
+    {
+        ++stats.mapped_samples;
+    }
+    else if (!any_valid_state)
+    {
+        ++stats.no_valid_state_samples;
+    }
+    else if (!any_reachable_state)
+    {
+        ++stats.unreachable_state_samples;
+    }
+
+    return true;
+}
+
+bool writeStatsMetadata(const std::filesystem::path &output_path,
+                        const std::size_t cell_count,
+                        const std::size_t reachable_cells,
+                        const std::size_t unreachable_cells,
+                        const std::size_t bytes_written,
+                        const RasterizationStats &rasterization_stats)
+{
+    auto metadata_path = output_path;
+    metadata_path += ".meta.json";
+    auto metadata_tmp = metadata_path;
+    metadata_tmp += ".tmp";
+
+    std::ofstream metadata(metadata_tmp, std::ios::trunc);
+    if (!metadata)
+    {
+        util::Log(logERROR) << "Could not open raster metadata path: " << metadata_tmp.string();
+        return false;
+    }
+    metadata << "{"
+             << "\"cells_total\":" << cell_count << ","
+             << "\"reachable_cells\":" << reachable_cells << ","
+             << "\"unreachable_cells\":" << unreachable_cells << ","
+             << "\"bytes\":" << bytes_written << ","
+             << "\"mapped_samples\":" << rasterization_stats.mapped_samples << ","
+             << "\"fallback_candidate_used_samples\":"
+             << rasterization_stats.fallback_candidate_used_samples << ","
+             << "\"no_candidate_samples\":" << rasterization_stats.no_candidate_samples << ","
+             << "\"no_valid_state_samples\":" << rasterization_stats.no_valid_state_samples << ","
+             << "\"unreachable_state_samples\":" << rasterization_stats.unreachable_state_samples << ","
+             << "\"capped_samples\":" << rasterization_stats.capped_samples
+             << "}\n";
+    metadata.close();
+    if (!metadata)
+    {
+        util::Log(logERROR) << "Failed flushing raster metadata: " << metadata_tmp.string();
+        return false;
+    }
+
+    std::error_code remove_error;
+    std::filesystem::remove(metadata_path, remove_error);
+    (void)remove_error;
+    std::error_code rename_error;
+    std::filesystem::rename(metadata_tmp, metadata_path, rename_error);
+    if (rename_error)
+    {
+        util::Log(logERROR) << "Failed to finalize raster metadata " << metadata_path.string()
+                            << ": " << rename_error.message();
+        std::error_code cleanup_error;
+        std::filesystem::remove(metadata_tmp, cleanup_error);
+        (void)cleanup_error;
+        return false;
+    }
+
+    return true;
+}
+
+bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cache_path,
+                                        const std::filesystem::path &sample_file_path,
+                                        const std::uint32_t expected_resolution,
+                                        const std::uint32_t connectivity_checksum,
+                                        const std::string &metric_name,
+                                        const std::optional<EdgeWeight> cap_metric,
+                                        const std::vector<EdgeWeight> &costs,
+                                        const std::filesystem::path &raster_output_path,
+                                        RasterizationStats &stats,
+                                        std::size_t &cell_count,
+                                        std::size_t &reachable_cells,
+                                        std::size_t &unreachable_cells,
+                                        std::size_t &bytes_written)
+{
+    std::uint64_t sample_file_size = 0;
+    std::int64_t sample_file_mtime_ticks = 0;
+    if (!readSampleFileFingerprint(sample_file_path, sample_file_size, sample_file_mtime_ticks))
+    {
+        return false;
+    }
+
+    std::ifstream cache_input(sample_cache_path, std::ios::binary);
+    if (!cache_input)
+    {
+        util::Log(logERROR) << "Could not open sample snap cache: " << sample_cache_path.string();
+        return false;
+    }
+
+    SampleSnapCacheHeader header;
+    if (!readSnapCacheHeader(cache_input, header))
+    {
+        util::Log(logERROR) << "Invalid sample snap cache header: " << sample_cache_path.string();
+        return false;
+    }
+    if (header.version != SAMPLE_SNAP_CACHE_VERSION ||
+        header.expected_resolution != expected_resolution ||
+        header.connectivity_checksum != connectivity_checksum ||
+        header.sample_file_size != sample_file_size ||
+        header.sample_file_mtime_ticks != sample_file_mtime_ticks)
+    {
+        util::Log(logERROR) << "Sample snap cache metadata mismatch: " << sample_cache_path.string();
+        return false;
+    }
+
+    const auto expected_size = SAMPLE_SNAP_CACHE_MAGIC.size() + sizeof(std::uint32_t) * 4 +
+                               sizeof(std::uint64_t) * 2 + sizeof(std::int64_t) +
+                               header.sample_count * SAMPLE_HINT_RECORD_BYTES;
+    std::error_code cache_size_error;
+    const auto actual_size = std::filesystem::file_size(sample_cache_path, cache_size_error);
+    if (cache_size_error || actual_size != expected_size)
+    {
+        util::Log(logERROR) << "Sample snap cache size mismatch: " << sample_cache_path.string();
+        return false;
+    }
+
+    auto output_tmp = raster_output_path;
+    output_tmp += ".tmp";
+    std::ofstream output(output_tmp, std::ios::binary | std::ios::trunc);
+    if (!output)
+    {
+        util::Log(logERROR) << "Could not open output artifact path: " << output_tmp.string();
+        return false;
+    }
+
+    stats = {};
+    cell_count = static_cast<std::size_t>(header.sample_count);
+    reachable_cells = 0;
+    unreachable_cells = 0;
+    bytes_written = 0;
+    std::size_t primary_hint_miss_count = 0;
+
+    for (const auto index : util::irange<std::uint64_t>(0, header.sample_count))
+    {
+        SamplePrimaryHint hint;
+        if (!readPrimaryHintRecord(cache_input, hint))
+        {
+            util::Log(logERROR) << "Failed reading sample snap cache record at index " << index;
+            return false;
+        }
+
+        EdgeWeight mapped_cost = INVALID_EDGE_WEIGHT;
+        if (!mapSampleFromPrimaryHint(hint, costs, mapped_cost, stats))
+        {
+            return false;
+        }
+        if (mapped_cost == INVALID_EDGE_WEIGHT)
+        {
+            ++primary_hint_miss_count;
+            ++stats.no_candidate_samples;
+        }
+
+        std::uint16_t encoded = UNREACHABLE_U16_INT;
+        if (mapped_cost == INVALID_EDGE_WEIGHT)
+        {
+            ++unreachable_cells;
+        }
+        else if (cap_metric.has_value() && mapped_cost > cap_metric.value())
+        {
+            ++stats.capped_samples;
+            ++unreachable_cells;
+        }
+        else
+        {
+            const auto ticks = from_alias<std::int64_t>(mapped_cost);
+            double seconds = static_cast<double>(ticks);
+            if (metric_name == "duration")
+            {
+                seconds = ticks / 10.0;
+            }
+            const auto rounded = std::nearbyint(seconds);
+            if (!std::isfinite(rounded) || rounded < 0.0)
+            {
+                ++unreachable_cells;
+            }
+            else
+            {
+                const auto clipped =
+                    std::min<double>(rounded, static_cast<double>(MAX_REACHABLE_U16_INT));
+                encoded = static_cast<std::uint16_t>(clipped);
+                ++reachable_cells;
+            }
+        }
+
+        const char bytes[2] = {
+            static_cast<char>(encoded & 0xFF),
+            static_cast<char>((encoded >> 8) & 0xFF),
+        };
+        output.write(bytes, sizeof(bytes));
+        if (!output.good())
+        {
+            util::Log(logERROR) << "Failed writing raster artifact bytes: " << output_tmp.string();
+            return false;
+        }
+    }
+
+    output.close();
+    if (!output)
+    {
+        util::Log(logERROR) << "Failed flushing raster artifact: " << output_tmp.string();
+        return false;
+    }
+
+    if (primary_hint_miss_count > 0)
+    {
+        util::Log(logWARNING) << "Primary snap hint could not map " << primary_hint_miss_count
+                              << " samples; they were marked unreachable.";
+    }
+
+    bytes_written = static_cast<std::size_t>(header.sample_count) * sizeof(std::uint16_t);
+    std::error_code remove_error;
+    std::filesystem::remove(raster_output_path, remove_error);
+    (void)remove_error;
+    std::error_code rename_error;
+    std::filesystem::rename(output_tmp, raster_output_path, rename_error);
+    if (rename_error)
+    {
+        util::Log(logERROR) << "Failed to finalize raster artifact " << raster_output_path.string()
+                            << ": " << rename_error.message();
+        std::error_code cleanup_error;
+        std::filesystem::remove(output_tmp, cleanup_error);
+        (void)cleanup_error;
+        return false;
+    }
+
+    if (!writeStatsMetadata(raster_output_path,
+                            cell_count,
+                            reachable_cells,
+                            unreachable_cells,
+                            bytes_written,
+                            stats))
+    {
+        return false;
+    }
+
+    return true;
+}
+} // namespace
 
 int main(int argc, char *argv[])
 try
@@ -114,11 +567,6 @@ try
     {
         return EXIT_FAILURE;
     }
-
-    const auto output_path = runtime_config.has_output_path
-                                 ? runtime_config.output_path
-                                 : osrm::contractor::phast::DefaultOutputPath(
-                                       phast_config.base_path, output_format_kind);
 
     std::shared_ptr<const osrm::contractor::phast::CHDataFacade> facade;
     if (!osrm::contractor::phast::LoadCHFacade(
@@ -214,6 +662,56 @@ try
                 << ", max distance: " << osrm::contractor::phast::MaxDistance(phast_distances)
                 << " ticks";
     util::Log() << "PHAST runtime: " << phast_elapsed << " ms";
+
+    if (runtime_config.has_raster_output_path)
+    {
+        if (runtime_metric_kind != osrm::contractor::phast::MetricKind::Duration ||
+            selected_orientation != osrm::contractor::PHASTOrientation::Reverse)
+        {
+            util::Log(logERROR) << "--raster-output requires --metric duration and --orientation reverse.";
+            return EXIT_FAILURE;
+        }
+
+        RasterizationStats rasterization_stats;
+        std::size_t cell_count = 0;
+        std::size_t reachable_cells = 0;
+        std::size_t unreachable_cells = 0;
+        std::size_t bytes_written = 0;
+
+        if (!writeDenseU16ArtifactFromSnapCache(runtime_config.sample_snap_cache,
+                                                runtime_config.sample_file,
+                                                runtime_config.expected_resolution,
+                                                phast_data.connectivity_checksum,
+                                                metric_name,
+                                                cap_metric,
+                                                phast_distances,
+                                                runtime_config.raster_output_path,
+                                                rasterization_stats,
+                                                cell_count,
+                                                reachable_cells,
+                                                unreachable_cells,
+                                                bytes_written))
+        {
+            return EXIT_FAILURE;
+        }
+
+        util::Log() << "Rasterized cells: " << cell_count;
+        util::Log() << "Reachable cells: " << reachable_cells;
+        util::Log() << "Unreachable cells: " << unreachable_cells;
+        util::Log() << "Mapped samples: " << rasterization_stats.mapped_samples;
+        util::Log() << "Capped samples: " << rasterization_stats.capped_samples;
+        util::Log() << "Samples with no snap candidates: " << rasterization_stats.no_candidate_samples;
+        util::Log() << "Output bytes: " << bytes_written;
+        util::Log() << "Wrote raster output: " << runtime_config.raster_output_path.string();
+
+        util::DumpMemoryStats();
+        return EXIT_SUCCESS;
+    }
+
+    const auto output_path = runtime_config.has_output_path
+                                 ? runtime_config.output_path
+                                 : osrm::contractor::phast::DefaultOutputPath(
+                                       phast_config.base_path, output_format_kind);
 
     const auto poi_count = runtime_config.has_poi_file ? seed_stats.poi_count : 0;
     const osrm::contractor::phast::OutputMetadata output_metadata{
