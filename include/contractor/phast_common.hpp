@@ -49,6 +49,8 @@ struct RuntimeConfig final
     bool has_sample_snap_cache = false;
     std::filesystem::path raster_output_path;
     bool has_raster_output_path = false;
+    std::filesystem::path task_file;
+    bool has_task_file = false;
     std::uint32_t expected_resolution = 9;
 };
 

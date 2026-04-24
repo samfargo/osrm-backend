@@ -26,6 +26,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -72,6 +73,13 @@ struct RasterizationStats
     std::size_t no_valid_state_samples = 0;
     std::size_t unreachable_state_samples = 0;
     std::size_t capped_samples = 0;
+};
+
+struct BatchRasterTask
+{
+    std::filesystem::path poi_file;
+    double cap_seconds = 0.;
+    std::filesystem::path raster_output_path;
 };
 
 constexpr std::uint8_t SAMPLE_HINT_HAS_FORWARD = 1U << 0;
@@ -158,6 +166,79 @@ bool readSampleFileFingerprint(const std::filesystem::path &sample_file_path,
         return false;
     }
     sample_file_mtime_ticks = static_cast<std::int64_t>(mtime.time_since_epoch().count());
+    return true;
+}
+
+std::string trim(const std::string &value)
+{
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos)
+    {
+        return {};
+    }
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+bool loadBatchRasterTasks(const std::filesystem::path &task_file, std::vector<BatchRasterTask> &tasks)
+{
+    std::ifstream input(task_file);
+    if (!input)
+    {
+        util::Log(logERROR) << "Could not open task file: " << task_file.string();
+        return false;
+    }
+
+    tasks.clear();
+    std::string line;
+    std::uint64_t line_number = 0;
+    while (std::getline(input, line))
+    {
+        ++line_number;
+        const auto row = trim(line);
+        if (row.empty() || row[0] == '#')
+        {
+            continue;
+        }
+
+        std::vector<std::string> fields;
+        std::string token;
+        std::istringstream row_stream(row);
+        while (std::getline(row_stream, token, '\t'))
+        {
+            fields.push_back(token);
+        }
+        if (fields.size() != 3)
+        {
+            util::Log(logERROR) << "Invalid task row at " << task_file.string() << ":" << line_number
+                                << " expected 3 tab-separated fields: poi_file,cap_seconds,raster_output";
+            return false;
+        }
+
+        double cap_seconds = 0.;
+        std::istringstream cap_parser(trim(fields[1]));
+        if (!(cap_parser >> cap_seconds) || !cap_parser.eof() || !std::isfinite(cap_seconds) ||
+            cap_seconds < 0.)
+        {
+            util::Log(logERROR) << "Invalid cap_seconds at " << task_file.string() << ":" << line_number;
+            return false;
+        }
+
+        const auto poi_file = std::filesystem::path(trim(fields[0]));
+        const auto raster_output_path = std::filesystem::path(trim(fields[2]));
+        if (poi_file.empty() || raster_output_path.empty())
+        {
+            util::Log(logERROR) << "Empty path field at " << task_file.string() << ":" << line_number;
+            return false;
+        }
+        tasks.push_back(BatchRasterTask{poi_file, cap_seconds, raster_output_path});
+    }
+
+    if (tasks.empty())
+    {
+        util::Log(logERROR) << "No tasks loaded from task file: " << task_file.string();
+        return false;
+    }
     return true;
 }
 
@@ -588,42 +669,47 @@ try
         return EXIT_FAILURE;
     }
 
-    std::vector<osrm::contractor::phast::PHASTSeed> seeds;
-    osrm::contractor::phast::SeedBuildStats seed_stats;
-    if (!osrm::contractor::phast::BuildSeeds(runtime_config,
-                                             phast_data.node_count,
-                                             seed_metric_kind,
-                                             selected_orientation,
-                                             *facade,
-                                             seeds,
-                                             seed_stats) ||
-        !osrm::contractor::phast::ValidateSeeds(phast_data.node_count, seeds))
+    auto run_phast_task = [&](const osrm::contractor::phast::RuntimeConfig &task_runtime,
+                              std::vector<EdgeWeight> &task_distances,
+                              std::optional<EdgeWeight> &task_cap_metric,
+                              osrm::contractor::phast::SeedBuildStats &task_seed_stats,
+                              std::size_t &task_upward_settled_nodes,
+                              std::size_t &task_downward_updates,
+                              std::int64_t &task_phast_elapsed_ms) -> bool
     {
-        return EXIT_FAILURE;
-    }
+        std::vector<osrm::contractor::phast::PHASTSeed> task_seeds;
+        if (!osrm::contractor::phast::BuildSeeds(task_runtime,
+                                                 phast_data.node_count,
+                                                 seed_metric_kind,
+                                                 selected_orientation,
+                                                 *facade,
+                                                 task_seeds,
+                                                 task_seed_stats) ||
+            !osrm::contractor::phast::ValidateSeeds(phast_data.node_count, task_seeds))
+        {
+            return false;
+        }
 
-    std::optional<EdgeWeight> cap_metric;
-    if (!osrm::contractor::phast::ParseTraversalCap(
-            runtime_config, properties, runtime_metric_kind, cap_metric))
-    {
-        return EXIT_FAILURE;
-    }
+        if (!osrm::contractor::phast::ParseTraversalCap(
+                task_runtime, properties, runtime_metric_kind, task_cap_metric))
+        {
+            return false;
+        }
 
-    std::vector<EdgeWeight> phast_distances;
-    std::size_t upward_settled_nodes = 0;
-    std::size_t downward_updates = 0;
-    const auto phast_start = std::chrono::steady_clock::now();
-    if (!osrm::contractor::phast::RunUpwardSearch(
-            adjacency, seeds, cap_metric, phast_distances, upward_settled_nodes) ||
-        !osrm::contractor::phast::RunDownwardSweep(
-            phast_data, adjacency, cap_metric, phast_distances, &downward_updates))
-    {
-        return EXIT_FAILURE;
-    }
-    const auto phast_elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                               phast_start)
-            .count();
+        const auto phast_started = std::chrono::steady_clock::now();
+        if (!osrm::contractor::phast::RunUpwardSearch(
+                adjacency, task_seeds, task_cap_metric, task_distances, task_upward_settled_nodes) ||
+            !osrm::contractor::phast::RunDownwardSweep(
+                phast_data, adjacency, task_cap_metric, task_distances, &task_downward_updates))
+        {
+            return false;
+        }
+        task_phast_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                   phast_started)
+                .count();
+        return true;
+    };
 
     util::Log() << "CH metric: " << metric_name;
     util::Log() << "PHAST nodes: " << phast_data.node_count;
@@ -639,14 +725,116 @@ try
                 << (adjacency.downward_built_from_transpose ? "yes" : "no");
     util::Log() << "Derived upward arcs: " << adjacency.up_targets.size();
     util::Log() << "Derived downward arcs: " << adjacency.down_targets.size();
-    util::Log() << "Seed count: " << seeds.size();
+
+    if (runtime_config.has_task_file)
+    {
+        if (runtime_metric_kind != osrm::contractor::phast::MetricKind::Duration ||
+            selected_orientation != osrm::contractor::PHASTOrientation::Reverse)
+        {
+            util::Log(logERROR) << "--task-file requires --metric duration and --orientation reverse.";
+            return EXIT_FAILURE;
+        }
+
+        std::vector<BatchRasterTask> batch_tasks;
+        if (!loadBatchRasterTasks(runtime_config.task_file, batch_tasks))
+        {
+            return EXIT_FAILURE;
+        }
+        util::Log() << "Batch tasks loaded: " << batch_tasks.size();
+
+        std::int64_t batch_phast_elapsed_ms = 0;
+        for (const auto index : util::irange<std::size_t>(0, batch_tasks.size()))
+        {
+            const auto &batch_task = batch_tasks[index];
+            osrm::contractor::phast::RuntimeConfig task_runtime = runtime_config;
+            task_runtime.poi_file = batch_task.poi_file;
+            task_runtime.has_poi_file = true;
+            task_runtime.seed_nodes.clear();
+            task_runtime.seed_file.clear();
+            task_runtime.has_seed_file = false;
+            task_runtime.has_cap_weight = false;
+            task_runtime.cap_weight = 0;
+            task_runtime.has_cap_seconds = true;
+            task_runtime.cap_seconds = batch_task.cap_seconds;
+
+            std::vector<EdgeWeight> task_distances;
+            std::optional<EdgeWeight> task_cap_metric;
+            osrm::contractor::phast::SeedBuildStats task_seed_stats;
+            std::size_t task_upward_settled_nodes = 0;
+            std::size_t task_downward_updates = 0;
+            std::int64_t task_phast_elapsed_ms = 0;
+
+            if (!run_phast_task(task_runtime,
+                                task_distances,
+                                task_cap_metric,
+                                task_seed_stats,
+                                task_upward_settled_nodes,
+                                task_downward_updates,
+                                task_phast_elapsed_ms))
+            {
+                return EXIT_FAILURE;
+            }
+            batch_phast_elapsed_ms += task_phast_elapsed_ms;
+
+            RasterizationStats rasterization_stats;
+            std::size_t cell_count = 0;
+            std::size_t reachable_cells = 0;
+            std::size_t unreachable_cells = 0;
+            std::size_t bytes_written = 0;
+
+            if (!writeDenseU16ArtifactFromSnapCache(task_runtime.sample_snap_cache,
+                                                    task_runtime.sample_file,
+                                                    task_runtime.expected_resolution,
+                                                    phast_data.connectivity_checksum,
+                                                    metric_name,
+                                                    task_cap_metric,
+                                                    task_distances,
+                                                    batch_task.raster_output_path,
+                                                    rasterization_stats,
+                                                    cell_count,
+                                                    reachable_cells,
+                                                    unreachable_cells,
+                                                    bytes_written))
+            {
+                return EXIT_FAILURE;
+            }
+
+            util::Log() << "Task " << (index + 1) << "/" << batch_tasks.size()
+                        << " POIs parsed: " << task_seed_stats.poi_count;
+            util::Log() << "Task " << (index + 1) << "/" << batch_tasks.size()
+                        << " PHAST runtime: " << task_phast_elapsed_ms << " ms";
+            util::Log() << "Task " << (index + 1) << "/" << batch_tasks.size()
+                        << " Wrote raster output: " << batch_task.raster_output_path.string();
+        }
+
+        util::Log() << "Batch PHAST runtime total: " << batch_phast_elapsed_ms << " ms";
+        util::DumpMemoryStats();
+        return EXIT_SUCCESS;
+    }
+
+    std::vector<EdgeWeight> phast_distances;
+    std::optional<EdgeWeight> cap_metric;
+    osrm::contractor::phast::SeedBuildStats seed_stats;
+    std::size_t upward_settled_nodes = 0;
+    std::size_t downward_updates = 0;
+    std::int64_t phast_elapsed = 0;
+    if (!run_phast_task(runtime_config,
+                        phast_distances,
+                        cap_metric,
+                        seed_stats,
+                        upward_settled_nodes,
+                        downward_updates,
+                        phast_elapsed))
+    {
+        return EXIT_FAILURE;
+    }
+
     if (runtime_config.has_poi_file)
     {
         util::Log() << "POIs parsed: " << seed_stats.poi_count;
         util::Log() << "Snap cache hits: " << seed_stats.cache_hits;
         util::Log() << "Big-component snap fallbacks: " << seed_stats.big_component_fallbacks;
     }
-
     if (cap_metric.has_value())
     {
         util::Log() << "Traversal cap: " << cap_metric.value() << " ticks";

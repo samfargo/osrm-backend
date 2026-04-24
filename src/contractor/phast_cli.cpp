@@ -73,6 +73,9 @@ ReturnCode ParseArguments(int argc,
         "raster-output",
         boost::program_options::value<std::filesystem::path>(&runtime_config.raster_output_path),
         "Output dense little-endian uint16 artifact path (.u16)")(
+        "task-file",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.task_file),
+        "TSV batch file rows: poi_file<tab>cap_seconds<tab>raster_output")(
         "resolution",
         boost::program_options::value<std::uint32_t>(&runtime_config.expected_resolution)
             ->default_value(9),
@@ -185,9 +188,22 @@ ReturnCode ParseArguments(int argc,
     {
         runtime_config.has_raster_output_path = true;
     }
+    if (option_variables.contains("task-file"))
+    {
+        runtime_config.has_task_file = true;
+    }
 
     const bool has_manual_seeds = !runtime_config.seed_nodes.empty() || runtime_config.has_seed_file;
-    if (has_manual_seeds == runtime_config.has_poi_file)
+    if (runtime_config.has_task_file)
+    {
+        if (runtime_config.has_poi_file || has_manual_seeds)
+        {
+            util::Log(logERROR)
+                << "--task-file cannot be combined with --poi-file, --seed-node, or --seed-file.";
+            return ReturnCode::Fail;
+        }
+    }
+    else if (has_manual_seeds == runtime_config.has_poi_file)
     {
         util::Log(logERROR)
             << "Provide exactly one seed source: --poi-file or --seed-node/--seed-file.";
@@ -234,6 +250,11 @@ ReturnCode ParseArguments(int argc,
     }
     if (runtime_config.has_raster_output_path)
     {
+        if (runtime_config.has_task_file)
+        {
+            util::Log(logERROR) << "Specify only one of --raster-output or --task-file.";
+            return ReturnCode::Fail;
+        }
         if (runtime_config.has_output_path)
         {
             util::Log(logERROR) << "Specify only one of --output or --raster-output.";
@@ -243,6 +264,26 @@ ReturnCode ParseArguments(int argc,
         {
             util::Log(logERROR)
                 << "--raster-output requires both --sample-file and --sample-snap-cache.";
+            return ReturnCode::Fail;
+        }
+    }
+    if (runtime_config.has_task_file)
+    {
+        if (runtime_config.has_output_path)
+        {
+            util::Log(logERROR) << "Specify only one of --output or --task-file.";
+            return ReturnCode::Fail;
+        }
+        if (!runtime_config.has_sample_file || !runtime_config.has_sample_snap_cache)
+        {
+            util::Log(logERROR)
+                << "--task-file requires both --sample-file and --sample-snap-cache.";
+            return ReturnCode::Fail;
+        }
+        if (runtime_config.has_cap_seconds || runtime_config.has_cap_weight)
+        {
+            util::Log(logERROR)
+                << "--task-file controls per-task caps; omit --cap-seconds/--cap-weight.";
             return ReturnCode::Fail;
         }
     }
