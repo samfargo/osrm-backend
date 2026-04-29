@@ -80,7 +80,10 @@ endmacro ()
 add_warning(all)
 add_warning(extra)
 add_warning(pedantic)
-add_warning(error) # treat all warnings as errors
+option(OSRM_STRICT_WARNINGS "Treat compiler warnings as errors" ON)
+if(OSRM_STRICT_WARNINGS)
+    add_warning(error) # treat all warnings as errors
+endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
     add_warning(strict-overflow=1)
 endif()
