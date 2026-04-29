@@ -16,6 +16,9 @@
 #include "util/log.hpp"
 #include "util/meminfo.hpp"
 
+#include <boost/uuid/detail/sha1.hpp>
+#include <h3api.h>
+
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -24,6 +27,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -36,8 +40,8 @@ using namespace osrm;
 
 namespace
 {
-constexpr std::uint32_t SAMPLE_SNAP_CACHE_VERSION = 1;
-constexpr std::array<char, 8> SAMPLE_SNAP_CACHE_MAGIC = {'P', 'H', 'S', 'N', 'A', 'P', '1', '\0'};
+constexpr std::uint32_t SAMPLE_SNAP_CACHE_VERSION = 2;
+constexpr std::array<char, 8> SAMPLE_SNAP_CACHE_MAGIC = {'P', 'H', 'S', 'N', 'A', 'P', '2', '\0'};
 constexpr std::uint16_t MAX_REACHABLE_U16_INT = 65534;
 constexpr std::uint16_t UNREACHABLE_U16_INT = 65535;
 
@@ -48,8 +52,17 @@ struct SampleSnapCacheHeader
     std::uint32_t expected_resolution = 0;
     std::uint32_t reserved = 0;
     std::uint64_t sample_count = 0;
-    std::uint64_t sample_file_size = 0;
-    std::int64_t sample_file_mtime_ticks = 0;
+    std::uint64_t ordinals_file_size = 0;
+    std::uint64_t ordinals_hash_hi = 0;
+    std::uint64_t ordinals_hash_lo = 0;
+};
+
+struct OrdinalsIdentity
+{
+    std::uint64_t sample_count = 0;
+    std::uint64_t ordinals_file_size = 0;
+    std::uint64_t ordinals_hash_hi = 0;
+    std::uint64_t ordinals_hash_lo = 0;
 };
 
 struct SamplePrimaryHint
@@ -79,6 +92,12 @@ struct BatchRasterTask
     std::filesystem::path poi_file;
     double cap_seconds = 0.;
     std::filesystem::path raster_output_path;
+};
+
+struct LoadedSampleSnapCache
+{
+    std::uint64_t sample_count = 0;
+    std::vector<SamplePrimaryHint> hints;
 };
 
 constexpr std::uint8_t SAMPLE_HINT_HAS_FORWARD = 1U << 0;
@@ -112,8 +131,8 @@ bool readSnapCacheHeader(std::istream &input, SampleSnapCacheHeader &header)
     }
     return readBinary(input, header.version) && readBinary(input, header.connectivity_checksum) &&
            readBinary(input, header.expected_resolution) && readBinary(input, header.reserved) &&
-           readBinary(input, header.sample_count) && readBinary(input, header.sample_file_size) &&
-           readBinary(input, header.sample_file_mtime_ticks);
+           readBinary(input, header.sample_count) && readBinary(input, header.ordinals_file_size) &&
+           readBinary(input, header.ordinals_hash_hi) && readBinary(input, header.ordinals_hash_lo);
 }
 
 bool readPrimaryHintRecord(std::istream &input, SamplePrimaryHint &hint)
@@ -143,28 +162,123 @@ bool readPrimaryHintRecord(std::istream &input, SamplePrimaryHint &hint)
     return true;
 }
 
-bool readSampleFileFingerprint(const std::filesystem::path &sample_file_path,
-                               std::uint64_t &sample_file_size,
-                               std::int64_t &sample_file_mtime_ticks)
+std::uint64_t decodeLittleEndianU64(const unsigned char *bytes)
 {
+    std::uint64_t value = 0;
+    for (const auto index : util::irange<std::size_t>(0, static_cast<std::size_t>(8)))
+    {
+        value |= static_cast<std::uint64_t>(bytes[index]) << (index * 8);
+    }
+    return value;
+}
+
+std::uint64_t loadBigEndianU64(const unsigned char *bytes)
+{
+    std::uint64_t value = 0;
+    for (const auto index : util::irange<std::size_t>(0, static_cast<std::size_t>(8)))
+    {
+        value = (value << 8) | static_cast<std::uint64_t>(bytes[index]);
+    }
+    return value;
+}
+
+std::array<unsigned char, 20>
+sha1DigestToBytes(const boost::uuids::detail::sha1::digest_type &digest)
+{
+    std::array<unsigned char, 20> bytes{};
+    for (const auto index : util::irange<std::size_t>(0, static_cast<std::size_t>(5)))
+    {
+        const auto word = static_cast<std::uint32_t>(digest[index]);
+        bytes[index * 4 + 0] = static_cast<unsigned char>((word >> 24) & 0xFF);
+        bytes[index * 4 + 1] = static_cast<unsigned char>((word >> 16) & 0xFF);
+        bytes[index * 4 + 2] = static_cast<unsigned char>((word >> 8) & 0xFF);
+        bytes[index * 4 + 3] = static_cast<unsigned char>(word & 0xFF);
+    }
+    return bytes;
+}
+
+bool loadOrdinalsIdentity(const std::filesystem::path &sample_ordinals_path,
+                          const std::uint32_t expected_resolution,
+                          OrdinalsIdentity &identity)
+{
+    identity = {};
+
     std::error_code size_error;
-    sample_file_size = std::filesystem::file_size(sample_file_path, size_error);
+    const auto ordinals_file_size = std::filesystem::file_size(sample_ordinals_path, size_error);
     if (size_error)
     {
-        util::Log(logERROR) << "Failed to read sample file size: " << sample_file_path.string()
-                            << " (" << size_error.message() << ")";
+        util::Log(logERROR) << "Failed to read ordinals file size: "
+                            << sample_ordinals_path.string() << " (" << size_error.message() << ")";
+        return false;
+    }
+    if (ordinals_file_size == 0 || ordinals_file_size % 8 != 0)
+    {
+        util::Log(logERROR) << "Invalid ordinals file byte size (must be >0 and divisible by 8): "
+                            << sample_ordinals_path.string() << " (" << ordinals_file_size
+                            << " bytes)";
         return false;
     }
 
-    std::error_code mtime_error;
-    const auto mtime = std::filesystem::last_write_time(sample_file_path, mtime_error);
-    if (mtime_error)
+    std::ifstream input(sample_ordinals_path, std::ios::binary);
+    if (!input)
     {
-        util::Log(logERROR) << "Failed to read sample file mtime: " << sample_file_path.string()
-                            << " (" << mtime_error.message() << ")";
+        util::Log(logERROR) << "Could not open ordinals file: " << sample_ordinals_path.string();
         return false;
     }
-    sample_file_mtime_ticks = static_cast<std::int64_t>(mtime.time_since_epoch().count());
+
+    boost::uuids::detail::sha1 hasher;
+    std::array<unsigned char, 8> raw{};
+    std::uint64_t previous_h3_id = 0;
+    bool saw_any_h3 = false;
+    std::uint64_t sample_count = 0;
+
+    while (input.read(reinterpret_cast<char *>(raw.data()), raw.size()))
+    {
+        hasher.process_bytes(raw.data(), raw.size());
+        const auto h3_id = decodeLittleEndianU64(raw.data());
+        if (!isValidCell(static_cast<H3Index>(h3_id)))
+        {
+            util::Log(logERROR) << "Invalid H3 cell id in ordinals file at index " << sample_count
+                                << ": " << h3_id;
+            return false;
+        }
+        const auto resolution = getResolution(static_cast<H3Index>(h3_id));
+        if (resolution != static_cast<int>(expected_resolution))
+        {
+            util::Log(logERROR) << "Unexpected H3 resolution in ordinals file at index "
+                                << sample_count << ": found " << resolution << ", expected "
+                                << expected_resolution;
+            return false;
+        }
+        if (saw_any_h3 && h3_id <= previous_h3_id)
+        {
+            util::Log(logERROR) << "Ordinals must be strictly increasing at index " << sample_count
+                                << " in " << sample_ordinals_path.string();
+            return false;
+        }
+        saw_any_h3 = true;
+        previous_h3_id = h3_id;
+        ++sample_count;
+    }
+    if (!input.eof())
+    {
+        util::Log(logERROR) << "Failed reading ordinals file: " << sample_ordinals_path.string();
+        return false;
+    }
+    if (sample_count == 0)
+    {
+        util::Log(logERROR) << "No ordinals loaded from: " << sample_ordinals_path.string();
+        return false;
+    }
+
+    boost::uuids::detail::sha1::digest_type digest{};
+    hasher.get_digest(digest);
+    const auto digest_bytes = sha1DigestToBytes(digest);
+
+    identity.sample_count = sample_count;
+    identity.ordinals_file_size = ordinals_file_size;
+    identity.ordinals_hash_hi = loadBigEndianU64(digest_bytes.data());
+    identity.ordinals_hash_lo = loadBigEndianU64(digest_bytes.data() + 8);
     return true;
 }
 
@@ -379,27 +493,12 @@ bool writeStatsMetadata(const std::filesystem::path &output_path,
     return true;
 }
 
-bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cache_path,
-                                        const std::filesystem::path &sample_file_path,
-                                        const std::uint32_t expected_resolution,
-                                        const std::uint32_t connectivity_checksum,
-                                        const std::string &metric_name,
-                                        const std::optional<EdgeWeight> cap_metric,
-                                        const std::vector<EdgeWeight> &costs,
-                                        const std::filesystem::path &raster_output_path,
-                                        RasterizationStats &stats,
-                                        std::size_t &cell_count,
-                                        std::size_t &reachable_cells,
-                                        std::size_t &unreachable_cells,
-                                        std::size_t &bytes_written)
+bool loadSampleSnapCache(const std::filesystem::path &sample_cache_path,
+                         const std::uint32_t expected_resolution,
+                         const std::uint32_t connectivity_checksum,
+                         const OrdinalsIdentity &ordinals_identity,
+                         LoadedSampleSnapCache &loaded_cache)
 {
-    std::uint64_t sample_file_size = 0;
-    std::int64_t sample_file_mtime_ticks = 0;
-    if (!readSampleFileFingerprint(sample_file_path, sample_file_size, sample_file_mtime_ticks))
-    {
-        return false;
-    }
-
     std::ifstream cache_input(sample_cache_path, std::ios::binary);
     if (!cache_input)
     {
@@ -416,15 +515,17 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
     if (header.version != SAMPLE_SNAP_CACHE_VERSION ||
         header.expected_resolution != expected_resolution ||
         header.connectivity_checksum != connectivity_checksum ||
-        header.sample_file_size != sample_file_size ||
-        header.sample_file_mtime_ticks != sample_file_mtime_ticks)
+        header.sample_count != ordinals_identity.sample_count ||
+        header.ordinals_file_size != ordinals_identity.ordinals_file_size ||
+        header.ordinals_hash_hi != ordinals_identity.ordinals_hash_hi ||
+        header.ordinals_hash_lo != ordinals_identity.ordinals_hash_lo)
     {
         util::Log(logERROR) << "Sample snap cache metadata mismatch: " << sample_cache_path.string();
         return false;
     }
 
     const auto expected_size = SAMPLE_SNAP_CACHE_MAGIC.size() + sizeof(std::uint32_t) * 4 +
-                               sizeof(std::uint64_t) * 2 + sizeof(std::int64_t) +
+                               sizeof(std::uint64_t) * 4 +
                                header.sample_count * SAMPLE_HINT_RECORD_BYTES;
     std::error_code cache_size_error;
     const auto actual_size = std::filesystem::file_size(sample_cache_path, cache_size_error);
@@ -434,6 +535,40 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
         return false;
     }
 
+    if (header.sample_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+    {
+        util::Log(logERROR) << "Sample snap cache sample_count does not fit into size_t.";
+        return false;
+    }
+
+    loaded_cache.sample_count = header.sample_count;
+    loaded_cache.hints.clear();
+    loaded_cache.hints.reserve(static_cast<std::size_t>(header.sample_count));
+    for (const auto index : util::irange<std::uint64_t>(0, header.sample_count))
+    {
+        SamplePrimaryHint hint;
+        if (!readPrimaryHintRecord(cache_input, hint))
+        {
+            util::Log(logERROR) << "Failed reading sample snap cache record at index " << index;
+            return false;
+        }
+        loaded_cache.hints.push_back(hint);
+    }
+
+    return true;
+}
+
+bool writeDenseU16ArtifactFromHints(const LoadedSampleSnapCache &loaded_cache,
+                                    const std::string &metric_name,
+                                    const std::optional<EdgeWeight> cap_metric,
+                                    const std::vector<EdgeWeight> &costs,
+                                    const std::filesystem::path &raster_output_path,
+                                    RasterizationStats &stats,
+                                    std::size_t &cell_count,
+                                    std::size_t &reachable_cells,
+                                    std::size_t &unreachable_cells,
+                                    std::size_t &bytes_written)
+{
     auto output_tmp = raster_output_path;
     output_tmp += ".tmp";
     std::ofstream output(output_tmp, std::ios::binary | std::ios::trunc);
@@ -444,21 +579,14 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
     }
 
     stats = {};
-    cell_count = static_cast<std::size_t>(header.sample_count);
+    cell_count = loaded_cache.hints.size();
     reachable_cells = 0;
     unreachable_cells = 0;
     bytes_written = 0;
     std::size_t primary_hint_miss_count = 0;
 
-    for (const auto index : util::irange<std::uint64_t>(0, header.sample_count))
+    for (const auto &hint : loaded_cache.hints)
     {
-        SamplePrimaryHint hint;
-        if (!readPrimaryHintRecord(cache_input, hint))
-        {
-            util::Log(logERROR) << "Failed reading sample snap cache record at index " << index;
-            return false;
-        }
-
         EdgeWeight mapped_cost = INVALID_EDGE_WEIGHT;
         if (!mapSampleFromPrimaryHint(hint, costs, mapped_cost, stats))
         {
@@ -527,7 +655,7 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
                               << " samples; they were marked unreachable.";
     }
 
-    bytes_written = static_cast<std::size_t>(header.sample_count) * sizeof(std::uint16_t);
+    bytes_written = loaded_cache.hints.size() * sizeof(std::uint16_t);
     std::error_code remove_error;
     std::filesystem::remove(raster_output_path, remove_error);
     (void)remove_error;
@@ -554,6 +682,41 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
     }
 
     return true;
+}
+
+bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cache_path,
+                                        const std::uint32_t expected_resolution,
+                                        const std::uint32_t connectivity_checksum,
+                                        const OrdinalsIdentity &ordinals_identity,
+                                        const std::string &metric_name,
+                                        const std::optional<EdgeWeight> cap_metric,
+                                        const std::vector<EdgeWeight> &costs,
+                                        const std::filesystem::path &raster_output_path,
+                                        RasterizationStats &stats,
+                                        std::size_t &cell_count,
+                                        std::size_t &reachable_cells,
+                                        std::size_t &unreachable_cells,
+                                        std::size_t &bytes_written)
+{
+    LoadedSampleSnapCache loaded_cache;
+    if (!loadSampleSnapCache(sample_cache_path,
+                             expected_resolution,
+                             connectivity_checksum,
+                             ordinals_identity,
+                             loaded_cache))
+    {
+        return false;
+    }
+    return writeDenseU16ArtifactFromHints(loaded_cache,
+                                          metric_name,
+                                          cap_metric,
+                                          costs,
+                                          raster_output_path,
+                                          stats,
+                                          cell_count,
+                                          reachable_cells,
+                                          unreachable_cells,
+                                          bytes_written);
 }
 } // namespace
 
@@ -723,12 +886,35 @@ try
     util::Log() << "Derived upward arcs: " << adjacency.up_targets.size();
     util::Log() << "Derived downward arcs: " << adjacency.down_targets.size();
 
+    std::optional<OrdinalsIdentity> ordinals_identity;
+    auto ensure_ordinals_identity = [&]() -> bool
+    {
+        if (ordinals_identity.has_value())
+        {
+            return true;
+        }
+        OrdinalsIdentity loaded_identity;
+        if (!loadOrdinalsIdentity(runtime_config.sample_ordinals,
+                                  runtime_config.expected_resolution,
+                                  loaded_identity))
+        {
+            return false;
+        }
+        util::Log() << "Sample ordinals rows: " << loaded_identity.sample_count;
+        ordinals_identity = loaded_identity;
+        return true;
+    };
+
     if (runtime_config.has_task_file)
     {
         if (runtime_metric_kind != osrm::contractor::phast::MetricKind::Duration ||
             selected_orientation != osrm::contractor::PHASTOrientation::Reverse)
         {
             util::Log(logERROR) << "--task-file requires --metric duration and --orientation reverse.";
+            return EXIT_FAILURE;
+        }
+        if (!ensure_ordinals_identity())
+        {
             return EXIT_FAILURE;
         }
 
@@ -738,6 +924,16 @@ try
             return EXIT_FAILURE;
         }
         util::Log() << "Batch tasks loaded: " << batch_tasks.size();
+
+        LoadedSampleSnapCache loaded_snap_cache;
+        if (!loadSampleSnapCache(runtime_config.sample_snap_cache,
+                                 runtime_config.expected_resolution,
+                                 phast_data.connectivity_checksum,
+                                 ordinals_identity.value(),
+                                 loaded_snap_cache))
+        {
+            return EXIT_FAILURE;
+        }
 
         std::int64_t batch_phast_elapsed_ms = 0;
         for (const auto index : util::irange<std::size_t>(0, batch_tasks.size()))
@@ -779,19 +975,16 @@ try
             std::size_t unreachable_cells = 0;
             std::size_t bytes_written = 0;
 
-            if (!writeDenseU16ArtifactFromSnapCache(task_runtime.sample_snap_cache,
-                                                    task_runtime.sample_file,
-                                                    task_runtime.expected_resolution,
-                                                    phast_data.connectivity_checksum,
-                                                    metric_name,
-                                                    task_cap_metric,
-                                                    task_distances,
-                                                    batch_task.raster_output_path,
-                                                    rasterization_stats,
-                                                    cell_count,
-                                                    reachable_cells,
-                                                    unreachable_cells,
-                                                    bytes_written))
+            if (!writeDenseU16ArtifactFromHints(loaded_snap_cache,
+                                                metric_name,
+                                                task_cap_metric,
+                                                task_distances,
+                                                batch_task.raster_output_path,
+                                                rasterization_stats,
+                                                cell_count,
+                                                reachable_cells,
+                                                unreachable_cells,
+                                                bytes_written))
             {
                 return EXIT_FAILURE;
             }
@@ -856,6 +1049,10 @@ try
             util::Log(logERROR) << "--raster-output requires --metric duration and --orientation reverse.";
             return EXIT_FAILURE;
         }
+        if (!ensure_ordinals_identity())
+        {
+            return EXIT_FAILURE;
+        }
 
         RasterizationStats rasterization_stats;
         std::size_t cell_count = 0;
@@ -864,9 +1061,9 @@ try
         std::size_t bytes_written = 0;
 
         if (!writeDenseU16ArtifactFromSnapCache(runtime_config.sample_snap_cache,
-                                                runtime_config.sample_file,
                                                 runtime_config.expected_resolution,
                                                 phast_data.connectivity_checksum,
+                                                ordinals_identity.value(),
                                                 metric_name,
                                                 cap_metric,
                                                 phast_distances,

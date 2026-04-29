@@ -64,9 +64,9 @@ ReturnCode ParseArguments(int argc,
         "output",
         boost::program_options::value<std::filesystem::path>(&runtime_config.output_path),
         "Output path (default: <input>.phastfield or <input>.phastfield.raw_u32)")(
-        "sample-file",
-        boost::program_options::value<std::filesystem::path>(&runtime_config.sample_file),
-        "CSV file with rows: h3_id,res,sample_index,lon,lat")(
+        "sample-ordinals",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.sample_ordinals),
+        "Little-endian uint64 ordinal IDs file (h3_r<res>_ordinals.u64)")(
         "sample-snap-cache",
         boost::program_options::value<std::filesystem::path>(&runtime_config.sample_snap_cache),
         "Primary snap cache file for sample points")(
@@ -79,7 +79,7 @@ ReturnCode ParseArguments(int argc,
         "resolution",
         boost::program_options::value<std::uint32_t>(&runtime_config.expected_resolution)
             ->default_value(9),
-        "Expected H3 resolution in sample file/cache (default 9)");
+        "Expected H3 resolution in sample ordinals/cache (default 9)");
 
     boost::program_options::options_description hidden_options("Hidden options");
     hidden_options.add_options()(
@@ -176,9 +176,9 @@ ReturnCode ParseArguments(int argc,
     {
         runtime_config.has_output_path = true;
     }
-    if (option_variables.contains("sample-file"))
+    if (option_variables.contains("sample-ordinals"))
     {
-        runtime_config.has_sample_file = true;
+        runtime_config.has_sample_ordinals = true;
     }
     if (option_variables.contains("sample-snap-cache"))
     {
@@ -260,10 +260,10 @@ ReturnCode ParseArguments(int argc,
             util::Log(logERROR) << "Specify only one of --output or --raster-output.";
             return ReturnCode::Fail;
         }
-        if (!runtime_config.has_sample_file || !runtime_config.has_sample_snap_cache)
+        if (!runtime_config.has_sample_ordinals || !runtime_config.has_sample_snap_cache)
         {
             util::Log(logERROR)
-                << "--raster-output requires both --sample-file and --sample-snap-cache.";
+                << "--raster-output requires both --sample-ordinals and --sample-snap-cache.";
             return ReturnCode::Fail;
         }
     }
@@ -274,10 +274,10 @@ ReturnCode ParseArguments(int argc,
             util::Log(logERROR) << "Specify only one of --output or --task-file.";
             return ReturnCode::Fail;
         }
-        if (!runtime_config.has_sample_file || !runtime_config.has_sample_snap_cache)
+        if (!runtime_config.has_sample_ordinals || !runtime_config.has_sample_snap_cache)
         {
             util::Log(logERROR)
-                << "--task-file requires both --sample-file and --sample-snap-cache.";
+                << "--task-file requires both --sample-ordinals and --sample-snap-cache.";
             return ReturnCode::Fail;
         }
         if (runtime_config.has_cap_seconds || runtime_config.has_cap_weight)

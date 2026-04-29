@@ -490,6 +490,14 @@ find_package(ZLIB REQUIRED)
 add_dependency_includes(${ZLIB_INCLUDE_DIRS})
 set(ZLIB_LIBRARY ${ZLIB_LIBRARIES})
 
+# H3 C API is required for PHAST ordinals-native rasterization/snap-cache preparation.
+find_path(H3_INCLUDE_DIR h3api.h)
+find_library(H3_LIBRARY NAMES h3 libh3)
+if(NOT H3_INCLUDE_DIR OR NOT H3_LIBRARY)
+  message(FATAL_ERROR "Required H3 C library not found (missing h3api.h and libh3)")
+endif()
+add_dependency_includes(${H3_INCLUDE_DIR})
+
 add_definitions(${OSRM_DEFINES})
 include_directories(SYSTEM ${DEPENDENCIES_INCLUDE_DIRS})
 
@@ -500,8 +508,8 @@ target_link_libraries(osrm-extract osrm_extract ${Boost_PROGRAM_OPTIONS_LIBRARY}
 target_link_libraries(osrm-partition osrm_partition ${Boost_PROGRAM_OPTIONS_LIBRARY})
 target_link_libraries(osrm-customize osrm_customize ${Boost_PROGRAM_OPTIONS_LIBRARY})
 target_link_libraries(osrm-contract osrm_contract ${Boost_PROGRAM_OPTIONS_LIBRARY})
-target_link_libraries(osrm-phast osrm_contract osrm ${Boost_PROGRAM_OPTIONS_LIBRARY})
-target_link_libraries(osrm-phast-rasterize osrm_contract osrm ${Boost_PROGRAM_OPTIONS_LIBRARY})
+target_link_libraries(osrm-phast osrm_contract osrm ${Boost_PROGRAM_OPTIONS_LIBRARY} ${H3_LIBRARY})
+target_link_libraries(osrm-phast-rasterize osrm_contract osrm ${Boost_PROGRAM_OPTIONS_LIBRARY} ${H3_LIBRARY})
 target_link_libraries(osrm-routed osrm ${Boost_PROGRAM_OPTIONS_LIBRARY} ${OPTIONAL_SOCKET_LIBS} ${ZLIB_LIBRARY})
 
 set(EXTRACTOR_LIBRARIES

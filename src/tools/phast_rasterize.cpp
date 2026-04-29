@@ -16,6 +16,8 @@
 #include "util/version.hpp"
 
 #include <boost/program_options.hpp>
+#include <boost/uuid/detail/sha1.hpp>
+#include <h3api.h>
 
 #include <algorithm>
 #include <array>
@@ -52,7 +54,7 @@ struct RasterizeConfig final : storage::IOConfig
 struct RuntimeConfig final
 {
     std::filesystem::path phastfield_path;
-    std::filesystem::path sample_file_path;
+    std::filesystem::path sample_ordinals_path;
     std::filesystem::path sample_snap_cache_path;
     std::filesystem::path output_path;
     std::uint32_t expected_resolution = 9;
@@ -107,8 +109,8 @@ using CHDataFacade =
     engine::datafacade::ContiguousInternalMemoryDataFacade<engine::routing_algorithms::ch::Algorithm>;
 
 constexpr std::uint32_t PHASTFIELD_SCHEMA_VERSION = 1;
-constexpr std::uint32_t SAMPLE_SNAP_CACHE_VERSION = 1;
-constexpr std::array<char, 8> SAMPLE_SNAP_CACHE_MAGIC = {'P', 'H', 'S', 'N', 'A', 'P', '1', '\0'};
+constexpr std::uint32_t SAMPLE_SNAP_CACHE_VERSION = 2;
+constexpr std::array<char, 8> SAMPLE_SNAP_CACHE_MAGIC = {'P', 'H', 'S', 'N', 'A', 'P', '2', '\0'};
 
 struct SamplePrimaryHint
 {
@@ -131,32 +133,18 @@ struct SampleSnapCacheHeader
     std::uint32_t expected_resolution = 0;
     std::uint32_t reserved = 0;
     std::uint64_t sample_count = 0;
-    std::uint64_t sample_file_size = 0;
-    std::int64_t sample_file_mtime_ticks = 0;
+    std::uint64_t ordinals_file_size = 0;
+    std::uint64_t ordinals_hash_hi = 0;
+    std::uint64_t ordinals_hash_lo = 0;
 };
 
-std::string trim(const std::string &value)
+struct OrdinalsIdentity
 {
-    const auto begin = value.find_first_not_of(" \t\r\n");
-    if (begin == std::string::npos)
-    {
-        return {};
-    }
-    const auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(begin, end - begin + 1);
-}
-
-std::vector<std::string> splitCommaLine(const std::string &line)
-{
-    std::vector<std::string> fields;
-    std::string token;
-    std::istringstream stream(line);
-    while (std::getline(stream, token, ','))
-    {
-        fields.push_back(trim(token));
-    }
-    return fields;
-}
+    std::uint64_t sample_count = 0;
+    std::uint64_t ordinals_file_size = 0;
+    std::uint64_t ordinals_hash_hi = 0;
+    std::uint64_t ordinals_hash_lo = 0;
+};
 
 template <typename T> bool writeBinary(std::ostream &output, const T &value)
 {
@@ -182,8 +170,8 @@ bool writeSnapCacheHeader(std::ostream &output, const SampleSnapCacheHeader &hea
     }
     return writeBinary(output, header.version) && writeBinary(output, header.connectivity_checksum) &&
            writeBinary(output, header.expected_resolution) && writeBinary(output, header.reserved) &&
-           writeBinary(output, header.sample_count) && writeBinary(output, header.sample_file_size) &&
-           writeBinary(output, header.sample_file_mtime_ticks);
+           writeBinary(output, header.sample_count) && writeBinary(output, header.ordinals_file_size) &&
+           writeBinary(output, header.ordinals_hash_hi) && writeBinary(output, header.ordinals_hash_lo);
 }
 
 bool readSnapCacheHeader(std::istream &input, SampleSnapCacheHeader &header)
@@ -199,46 +187,173 @@ bool readSnapCacheHeader(std::istream &input, SampleSnapCacheHeader &header)
     }
     return readBinary(input, header.version) && readBinary(input, header.connectivity_checksum) &&
            readBinary(input, header.expected_resolution) && readBinary(input, header.reserved) &&
-           readBinary(input, header.sample_count) && readBinary(input, header.sample_file_size) &&
-           readBinary(input, header.sample_file_mtime_ticks);
+           readBinary(input, header.sample_count) && readBinary(input, header.ordinals_file_size) &&
+           readBinary(input, header.ordinals_hash_hi) && readBinary(input, header.ordinals_hash_lo);
 }
 
-bool readSampleFileFingerprint(const std::filesystem::path &sample_file_path,
-                               std::uint64_t &sample_file_size,
-                               std::int64_t &sample_file_mtime_ticks)
+std::uint64_t decodeLittleEndianU64(const unsigned char *bytes)
 {
+    std::uint64_t value = 0;
+    for (const auto index : util::irange<std::size_t>(0, static_cast<std::size_t>(8)))
+    {
+        value |= static_cast<std::uint64_t>(bytes[index]) << (index * 8);
+    }
+    return value;
+}
+
+std::uint64_t loadBigEndianU64(const unsigned char *bytes)
+{
+    std::uint64_t value = 0;
+    for (const auto index : util::irange<std::size_t>(0, static_cast<std::size_t>(8)))
+    {
+        value = (value << 8) | static_cast<std::uint64_t>(bytes[index]);
+    }
+    return value;
+}
+
+std::array<unsigned char, 20>
+sha1DigestToBytes(const boost::uuids::detail::sha1::digest_type &digest)
+{
+    std::array<unsigned char, 20> bytes{};
+    for (const auto index : util::irange<std::size_t>(0, static_cast<std::size_t>(5)))
+    {
+        const auto word = static_cast<std::uint32_t>(digest[index]);
+        bytes[index * 4 + 0] = static_cast<unsigned char>((word >> 24) & 0xFF);
+        bytes[index * 4 + 1] = static_cast<unsigned char>((word >> 16) & 0xFF);
+        bytes[index * 4 + 2] = static_cast<unsigned char>((word >> 8) & 0xFF);
+        bytes[index * 4 + 3] = static_cast<unsigned char>(word & 0xFF);
+    }
+    return bytes;
+}
+
+bool loadOrdinalsIdentityAndCoordinates(const std::filesystem::path &sample_ordinals_path,
+                                        const std::uint32_t expected_resolution,
+                                        OrdinalsIdentity &identity,
+                                        std::vector<util::Coordinate> &coordinates)
+{
+    constexpr double RAD_TO_DEG = 57.295779513082320876798154814105;
+
+    identity = {};
+    coordinates.clear();
+
     std::error_code size_error;
-    sample_file_size = std::filesystem::file_size(sample_file_path, size_error);
+    const auto ordinals_file_size = std::filesystem::file_size(sample_ordinals_path, size_error);
     if (size_error)
     {
-        util::Log(logERROR) << "Failed to read sample file size: " << sample_file_path.string()
-                            << " (" << size_error.message() << ")";
+        util::Log(logERROR) << "Failed to read ordinals file size: "
+                            << sample_ordinals_path.string() << " (" << size_error.message() << ")";
+        return false;
+    }
+    if (ordinals_file_size == 0 || ordinals_file_size % 8 != 0)
+    {
+        util::Log(logERROR) << "Invalid ordinals file byte size (must be >0 and divisible by 8): "
+                            << sample_ordinals_path.string() << " (" << ordinals_file_size
+                            << " bytes)";
         return false;
     }
 
-    std::error_code mtime_error;
-    const auto mtime = std::filesystem::last_write_time(sample_file_path, mtime_error);
-    if (mtime_error)
+    std::ifstream input(sample_ordinals_path, std::ios::binary);
+    if (!input)
     {
-        util::Log(logERROR) << "Failed to read sample file mtime: " << sample_file_path.string()
-                            << " (" << mtime_error.message() << ")";
+        util::Log(logERROR) << "Could not open ordinals file: " << sample_ordinals_path.string();
         return false;
     }
-    sample_file_mtime_ticks = static_cast<std::int64_t>(mtime.time_since_epoch().count());
+
+    boost::uuids::detail::sha1 hasher;
+    std::array<unsigned char, 8> raw{};
+    std::uint64_t previous_h3_id = 0;
+    bool saw_any_h3 = false;
+    std::uint64_t sample_count = 0;
+
+    const auto expected_rows =
+        static_cast<std::size_t>(ordinals_file_size / static_cast<std::uint64_t>(8));
+    coordinates.reserve(expected_rows);
+
+    while (input.read(reinterpret_cast<char *>(raw.data()), raw.size()))
+    {
+        hasher.process_bytes(raw.data(), raw.size());
+        const auto h3_id = decodeLittleEndianU64(raw.data());
+        if (!isValidCell(static_cast<H3Index>(h3_id)))
+        {
+            util::Log(logERROR) << "Invalid H3 cell id in ordinals file at index " << sample_count
+                                << ": " << h3_id;
+            return false;
+        }
+        const auto resolution = getResolution(static_cast<H3Index>(h3_id));
+        if (resolution != static_cast<int>(expected_resolution))
+        {
+            util::Log(logERROR) << "Unexpected H3 resolution in ordinals file at index "
+                                << sample_count << ": found " << resolution << ", expected "
+                                << expected_resolution;
+            return false;
+        }
+        if (saw_any_h3 && h3_id <= previous_h3_id)
+        {
+            util::Log(logERROR) << "Ordinals must be strictly increasing at index " << sample_count
+                                << " in " << sample_ordinals_path.string();
+            return false;
+        }
+        saw_any_h3 = true;
+        previous_h3_id = h3_id;
+
+        LatLng lat_lng{};
+        if (cellToLatLng(static_cast<H3Index>(h3_id), &lat_lng) != E_SUCCESS)
+        {
+            util::Log(logERROR) << "Failed to derive centroid for H3 cell " << h3_id
+                                << " at index " << sample_count;
+            return false;
+        }
+        const auto lon_deg = lat_lng.lng * RAD_TO_DEG;
+        const auto lat_deg = lat_lng.lat * RAD_TO_DEG;
+        try
+        {
+            coordinates.push_back(util::Coordinate{
+                util::UnsafeFloatLongitude{lon_deg},
+                util::UnsafeFloatLatitude{lat_deg},
+            });
+        }
+        catch (const std::exception &)
+        {
+            util::Log(logERROR) << "Invalid centroid coordinate for H3 cell " << h3_id
+                                << " at index " << sample_count;
+            return false;
+        }
+        ++sample_count;
+    }
+    if (!input.eof())
+    {
+        util::Log(logERROR) << "Failed reading ordinals file: " << sample_ordinals_path.string();
+        return false;
+    }
+    if (sample_count == 0)
+    {
+        util::Log(logERROR) << "No ordinals loaded from: " << sample_ordinals_path.string();
+        return false;
+    }
+
+    boost::uuids::detail::sha1::digest_type digest{};
+    hasher.get_digest(digest);
+    const auto digest_bytes = sha1DigestToBytes(digest);
+
+    identity.sample_count = sample_count;
+    identity.ordinals_file_size = ordinals_file_size;
+    identity.ordinals_hash_hi = loadBigEndianU64(digest_bytes.data());
+    identity.ordinals_hash_lo = loadBigEndianU64(digest_bytes.data() + 8);
     return true;
 }
 
 bool sampleSnapCacheHeaderMatches(const SampleSnapCacheHeader &header,
                                   const std::uint32_t expected_resolution,
                                   const std::uint32_t connectivity_checksum,
-                                  const std::uint64_t sample_file_size,
-                                  const std::int64_t sample_file_mtime_ticks)
+                                  const OrdinalsIdentity &identity)
 {
     return header.version == SAMPLE_SNAP_CACHE_VERSION &&
            header.expected_resolution == expected_resolution &&
            header.connectivity_checksum == connectivity_checksum &&
-           header.sample_file_size == sample_file_size &&
-           header.sample_file_mtime_ticks == sample_file_mtime_ticks;
+           header.sample_count == identity.sample_count &&
+           header.ordinals_file_size == identity.ordinals_file_size &&
+           header.ordinals_hash_hi == identity.ordinals_hash_hi &&
+           header.ordinals_hash_lo == identity.ordinals_hash_lo;
 }
 
 bool readSampleSnapCacheMetadata(const std::filesystem::path &cache_path, SampleSnapCacheHeader &header)
@@ -270,9 +385,9 @@ parseArguments(int argc,
         "phastfield",
         boost::program_options::value<std::filesystem::path>(&runtime_config.phastfield_path),
         "Path to .phastfield artifact emitted by osrm-phast")(
-        "sample-file",
-        boost::program_options::value<std::filesystem::path>(&runtime_config.sample_file_path),
-        "CSV file with rows: h3_id,res,sample_index,lon,lat")(
+        "sample-ordinals",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.sample_ordinals_path),
+        "Little-endian uint64 ordinal IDs file (h3_r<res>_ordinals.u64)")(
         "sample-snap-cache",
         boost::program_options::value<std::filesystem::path>(&runtime_config.sample_snap_cache_path),
         "Primary snap cache file for sample points")(
@@ -285,7 +400,7 @@ parseArguments(int argc,
         "resolution",
         boost::program_options::value<std::uint32_t>(&runtime_config.expected_resolution)
             ->default_value(9),
-        "Expected H3 resolution in sample file (default 9)");
+        "Expected H3 resolution in ordinals file (default 9)");
 
     boost::program_options::options_description hidden_options("Hidden options");
     hidden_options.add_options()(
@@ -346,9 +461,9 @@ parseArguments(int argc,
         std::cout << visible_options;
         return return_code::fail;
     }
-    if (!option_variables.contains("sample-file") || runtime_config.sample_file_path.empty())
+    if (!option_variables.contains("sample-ordinals") || runtime_config.sample_ordinals_path.empty())
     {
-        util::Log(logERROR) << "--sample-file is required.";
+        util::Log(logERROR) << "--sample-ordinals is required.";
         return return_code::fail;
     }
     if (runtime_config.sample_snap_cache_path.empty())
@@ -534,100 +649,6 @@ bool tryAddCost(const EdgeWeight lhs, const EdgeWeight rhs, EdgeWeight &sum)
     return true;
 }
 
-bool parseSampleCsvRow(const std::filesystem::path &path,
-                       const std::uint64_t line_number,
-                       const std::uint32_t expected_resolution,
-                       const std::string &line,
-                       std::uint64_t &h3_id,
-                       std::uint32_t &sample_index,
-                       util::Coordinate &coordinate)
-{
-    const auto trimmed = trim(line);
-    if (trimmed.empty() || trimmed[0] == '#')
-    {
-        return false;
-    }
-
-    const auto fields = splitCommaLine(trimmed);
-    if (fields.size() < 5)
-    {
-        util::Log(logERROR) << "Invalid sample row at " << path.string() << ":" << line_number
-                            << ". Expected: h3_id,res,sample_index,lon,lat";
-        throw std::runtime_error("invalid sample row");
-    }
-    if (line_number == 1 && fields[0] == "h3_id")
-    {
-        return false;
-    }
-
-    std::uint64_t resolution = 0;
-    double lon = 0.;
-    double lat = 0.;
-
-    std::istringstream h3_parser(fields[0]);
-    if (!(h3_parser >> h3_id) || !h3_parser.eof())
-    {
-        util::Log(logERROR) << "Invalid h3_id at " << path.string() << ":" << line_number;
-        throw std::runtime_error("invalid h3_id");
-    }
-
-    std::istringstream res_parser(fields[1]);
-    if (!(res_parser >> resolution) || !res_parser.eof())
-    {
-        util::Log(logERROR) << "Invalid resolution at " << path.string() << ":" << line_number;
-        throw std::runtime_error("invalid resolution");
-    }
-    if (resolution != expected_resolution)
-    {
-        util::Log(logERROR) << "Unexpected resolution at " << path.string() << ":" << line_number
-                            << ". Found " << resolution << ", expected " << expected_resolution
-                            << ".";
-        throw std::runtime_error("unexpected resolution");
-    }
-
-    std::uint64_t sample_index_raw = 0;
-    std::istringstream idx_parser(fields[2]);
-    if (!(idx_parser >> sample_index_raw) || !idx_parser.eof())
-    {
-        util::Log(logERROR) << "Invalid sample_index at " << path.string() << ":" << line_number;
-        throw std::runtime_error("invalid sample index");
-    }
-    if (sample_index_raw > std::numeric_limits<std::uint32_t>::max())
-    {
-        util::Log(logERROR) << "sample_index out of range at " << path.string() << ":" << line_number;
-        throw std::runtime_error("sample index out of range");
-    }
-    sample_index = static_cast<std::uint32_t>(sample_index_raw);
-
-    std::istringstream lon_parser(fields[3]);
-    if (!(lon_parser >> lon) || !lon_parser.eof())
-    {
-        util::Log(logERROR) << "Invalid lon at " << path.string() << ":" << line_number;
-        throw std::runtime_error("invalid lon");
-    }
-    std::istringstream lat_parser(fields[4]);
-    if (!(lat_parser >> lat) || !lat_parser.eof())
-    {
-        util::Log(logERROR) << "Invalid lat at " << path.string() << ":" << line_number;
-        throw std::runtime_error("invalid lat");
-    }
-
-    try
-    {
-        coordinate = util::Coordinate{
-            util::UnsafeFloatLongitude{lon},
-            util::UnsafeFloatLatitude{lat},
-        };
-    }
-    catch (const std::exception &)
-    {
-        util::Log(logERROR) << "Invalid coordinate at " << path.string() << ":" << line_number;
-        throw std::runtime_error("invalid coordinate");
-    }
-
-    return true;
-}
-
 bool buildPrimaryHintForSample(const CHDataFacade &facade, const util::Coordinate &coordinate, SamplePrimaryHint &hint)
 {
     hint = {};
@@ -754,7 +775,7 @@ bool readPrimaryHintRecord(std::istream &input, SamplePrimaryHint &hint)
 }
 
 bool ensureSampleSnapCache(const CHDataFacade &facade,
-                           const std::filesystem::path &sample_file_path,
+                           const std::filesystem::path &sample_ordinals_path,
                            const std::uint32_t expected_resolution,
                            const std::filesystem::path &cache_path,
                            std::uint64_t &sample_count,
@@ -763,12 +784,14 @@ bool ensureSampleSnapCache(const CHDataFacade &facade,
     sample_count = 0;
     reused_existing_cache = false;
 
-    std::uint64_t sample_file_size = 0;
-    std::int64_t sample_file_mtime_ticks = 0;
-    if (!readSampleFileFingerprint(sample_file_path, sample_file_size, sample_file_mtime_ticks))
+    OrdinalsIdentity ordinals_identity;
+    std::vector<util::Coordinate> sample_coordinates;
+    if (!loadOrdinalsIdentityAndCoordinates(
+            sample_ordinals_path, expected_resolution, ordinals_identity, sample_coordinates))
     {
         return false;
     }
+    sample_count = ordinals_identity.sample_count;
 
     const auto connectivity_checksum = facade.GetCheckSum();
     SampleSnapCacheHeader cached_header;
@@ -776,11 +799,10 @@ bool ensureSampleSnapCache(const CHDataFacade &facade,
         sampleSnapCacheHeaderMatches(cached_header,
                                      expected_resolution,
                                      connectivity_checksum,
-                                     sample_file_size,
-                                     sample_file_mtime_ticks))
+                                     ordinals_identity))
     {
         const auto expected_size = SAMPLE_SNAP_CACHE_MAGIC.size() + sizeof(std::uint32_t) * 4 +
-                                   sizeof(std::uint64_t) * 2 + sizeof(std::int64_t) +
+                                   sizeof(std::uint64_t) * 4 +
                                    cached_header.sample_count * SAMPLE_HINT_RECORD_BYTES;
         std::error_code file_size_error;
         const auto actual_size = std::filesystem::file_size(cache_path, file_size_error);
@@ -790,13 +812,6 @@ bool ensureSampleSnapCache(const CHDataFacade &facade,
             reused_existing_cache = true;
             return true;
         }
-    }
-
-    std::ifstream sample_input(sample_file_path);
-    if (!sample_input)
-    {
-        util::Log(logERROR) << "Could not open sample file: " << sample_file_path.string();
-        return false;
     }
 
     std::error_code cache_parent_error;
@@ -824,58 +839,19 @@ bool ensureSampleSnapCache(const CHDataFacade &facade,
     SampleSnapCacheHeader header;
     header.connectivity_checksum = connectivity_checksum;
     header.expected_resolution = expected_resolution;
-    header.sample_file_size = sample_file_size;
-    header.sample_file_mtime_ticks = sample_file_mtime_ticks;
+    header.sample_count = ordinals_identity.sample_count;
+    header.ordinals_file_size = ordinals_identity.ordinals_file_size;
+    header.ordinals_hash_hi = ordinals_identity.ordinals_hash_hi;
+    header.ordinals_hash_lo = ordinals_identity.ordinals_hash_lo;
     if (!writeSnapCacheHeader(cache_output, header))
     {
         util::Log(logERROR) << "Failed writing snap cache header: " << cache_tmp.string();
         return false;
     }
 
-    std::string line;
-    std::uint64_t line_number = 0;
-    std::uint64_t previous_h3_id = 0;
-    bool saw_any_h3 = false;
-    while (std::getline(sample_input, line))
+    sample_count = 0;
+    for (const auto &coordinate : sample_coordinates)
     {
-        ++line_number;
-        std::uint64_t h3_id = 0;
-        std::uint32_t sample_index = 0;
-        util::Coordinate coordinate;
-        try
-        {
-            if (!parseSampleCsvRow(sample_file_path,
-                                   line_number,
-                                   expected_resolution,
-                                   line,
-                                   h3_id,
-                                   sample_index,
-                                   coordinate))
-            {
-                continue;
-            }
-        }
-        catch (const std::exception &)
-        {
-            return false;
-        }
-
-        if (sample_index != 0)
-        {
-            util::Log(logERROR) << "Sample snap cache requires sample_index=0 rows. Found "
-                                << sample_index << " at " << sample_file_path.string() << ":"
-                                << line_number;
-            return false;
-        }
-        if (saw_any_h3 && h3_id <= previous_h3_id)
-        {
-            util::Log(logERROR) << "Sample file must be strictly increasing by h3_id for snap cache: "
-                                << sample_file_path.string() << ":" << line_number;
-            return false;
-        }
-        saw_any_h3 = true;
-        previous_h3_id = h3_id;
-
         SamplePrimaryHint hint;
         if (!buildPrimaryHintForSample(facade, coordinate, hint))
         {
@@ -891,11 +867,16 @@ bool ensureSampleSnapCache(const CHDataFacade &facade,
 
     if (sample_count == 0)
     {
-        util::Log(logERROR) << "No sample points loaded from: " << sample_file_path.string();
+        util::Log(logERROR) << "No sample points loaded from ordinals: "
+                            << sample_ordinals_path.string();
         return false;
     }
-
-    header.sample_count = sample_count;
+    if (sample_count != header.sample_count)
+    {
+        util::Log(logERROR) << "Sample count mismatch while building snap cache from ordinals: "
+                            << sample_count << " vs header " << header.sample_count;
+        return false;
+    }
     cache_output.seekp(0, std::ios::beg);
     if (!writeSnapCacheHeader(cache_output, header))
     {
@@ -1012,7 +993,7 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &cache_path,
     }
 
     const auto expected_size = SAMPLE_SNAP_CACHE_MAGIC.size() + sizeof(std::uint32_t) * 4 +
-                               sizeof(std::uint64_t) * 2 + sizeof(std::int64_t) +
+                               sizeof(std::uint64_t) * 4 +
                                header.sample_count * SAMPLE_HINT_RECORD_BYTES;
     std::error_code cache_size_error;
     const auto actual_size = std::filesystem::file_size(cache_path, cache_size_error);
@@ -1226,7 +1207,7 @@ try
     }
 
     util::Log() << "Input file: " << rasterize_config.base_path.string() << ".osrm";
-    util::Log() << "Sample file: " << runtime_config.sample_file_path.string();
+    util::Log() << "Sample ordinals: " << runtime_config.sample_ordinals_path.string();
     util::Log() << "Expected H3 resolution: " << runtime_config.expected_resolution;
     if (!runtime_config.sample_snap_cache_path.empty())
     {
@@ -1246,7 +1227,7 @@ try
         std::uint64_t cache_samples = 0;
         bool reused_existing_cache = false;
         if (!ensureSampleSnapCache(*facade,
-                                   runtime_config.sample_file_path,
+                                   runtime_config.sample_ordinals_path,
                                    runtime_config.expected_resolution,
                                    runtime_config.sample_snap_cache_path,
                                    cache_samples,
@@ -1321,7 +1302,7 @@ try
     std::uint64_t cache_samples = 0;
     bool reused_existing_cache = false;
     if (!ensureSampleSnapCache(*facade,
-                               runtime_config.sample_file_path,
+                               runtime_config.sample_ordinals_path,
                                runtime_config.expected_resolution,
                                runtime_config.sample_snap_cache_path,
                                cache_samples,

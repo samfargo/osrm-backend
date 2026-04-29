@@ -43,8 +43,8 @@ struct RuntimeConfig final
     std::string output_format = "phastfield-v1";
     std::filesystem::path output_path;
     bool has_output_path = false;
-    std::filesystem::path sample_file;
-    bool has_sample_file = false;
+    std::filesystem::path sample_ordinals;
+    bool has_sample_ordinals = false;
     std::filesystem::path sample_snap_cache;
     bool has_sample_snap_cache = false;
     std::filesystem::path raster_output_path;
