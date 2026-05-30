@@ -725,6 +725,11 @@ try
 {
     util::LogPolicy::GetInstance().Unmute();
 
+    const auto ms_between = [](std::chrono::steady_clock::time_point a,
+                               std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
+
     std::string verbosity;
     osrm::contractor::phast::PhastConfig phast_config;
     osrm::contractor::phast::RuntimeConfig runtime_config;
@@ -749,6 +754,8 @@ try
 
     util::Log() << "Input file: " << phast_config.base_path.string() << ".osrm";
 
+    const auto t_load_start = std::chrono::steady_clock::now();
+
     extractor::ProfileProperties properties;
     extractor::files::readProfileProperties(phast_config.GetPath(".osrm.properties"), properties);
     const std::string metric_name = properties.GetWeightName();
@@ -759,6 +766,8 @@ try
 
     osrm::contractor::PhastData phast_data;
     osrm::contractor::files::readPhast(phast_config.GetPath(".osrm.phast"), phast_data);
+
+    const auto t_graph_files_loaded = std::chrono::steady_clock::now();
 
     const auto &metric = metrics.at(metric_name);
     const auto &graph = metric.graph;
@@ -809,6 +818,7 @@ try
         return EXIT_FAILURE;
     }
 
+    const auto t_before_facade = std::chrono::steady_clock::now();
     std::shared_ptr<const osrm::contractor::phast::CHDataFacade> facade;
     if (!osrm::contractor::phast::LoadCHFacade(
             phast_config.base_path, metric_name, selected_exclude_index, facade) ||
@@ -816,9 +826,11 @@ try
     {
         return EXIT_FAILURE;
     }
+    const auto t_after_facade = std::chrono::steady_clock::now();
 
     const auto &selected_edge_filter = metric.edge_filter[selected_exclude_index];
     osrm::contractor::phast::DerivedAdjacency adjacency;
+    const auto t_before_adjacency = std::chrono::steady_clock::now();
     if (!osrm::contractor::phast::DeriveAdjacency(graph,
                                                   selected_edge_filter,
                                                   phast_data,
@@ -828,6 +840,15 @@ try
     {
         return EXIT_FAILURE;
     }
+    const auto t_after_adjacency = std::chrono::steady_clock::now();
+
+    util::Log() << "[timing] graph files load (.properties/.hsgr/.phast): "
+                << ms_between(t_load_start, t_graph_files_loaded) << " ms";
+    util::Log() << "[timing] CH facade load: " << ms_between(t_before_facade, t_after_facade) << " ms";
+    util::Log() << "[timing] derive adjacency: " << ms_between(t_before_adjacency, t_after_adjacency)
+                << " ms";
+    util::Log() << "[timing] total graph load: " << ms_between(t_load_start, t_after_adjacency)
+                << " ms";
 
     auto run_phast_task = [&](const osrm::contractor::phast::RuntimeConfig &task_runtime,
                               std::vector<EdgeWeight> &task_distances,
@@ -835,7 +856,9 @@ try
                               osrm::contractor::phast::SeedBuildStats &task_seed_stats,
                               std::size_t &task_upward_settled_nodes,
                               std::size_t &task_downward_updates,
-                              std::int64_t &task_phast_elapsed_ms) -> bool
+                              std::int64_t &task_phast_elapsed_ms,
+                              std::int64_t &task_upward_elapsed_ms,
+                              std::int64_t &task_downward_elapsed_ms) -> bool
     {
         std::vector<osrm::contractor::phast::PHASTSeed> task_seeds;
         if (!osrm::contractor::phast::BuildSeeds(task_runtime,
@@ -858,16 +881,23 @@ try
 
         const auto phast_started = std::chrono::steady_clock::now();
         if (!osrm::contractor::phast::RunUpwardSearch(
-                adjacency, task_seeds, task_cap_metric, task_distances, task_upward_settled_nodes) ||
-            !osrm::contractor::phast::RunDownwardSweep(
+                adjacency, task_seeds, task_cap_metric, task_distances, task_upward_settled_nodes))
+        {
+            return false;
+        }
+        const auto upward_done = std::chrono::steady_clock::now();
+        if (!osrm::contractor::phast::RunDownwardSweep(
                 phast_data, adjacency, task_cap_metric, task_distances, &task_downward_updates))
         {
             return false;
         }
+        const auto downward_done = std::chrono::steady_clock::now();
+        task_upward_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(upward_done - phast_started).count();
+        task_downward_elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(downward_done - upward_done).count();
         task_phast_elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                   phast_started)
-                .count();
+            std::chrono::duration_cast<std::chrono::milliseconds>(downward_done - phast_started).count();
         return true;
     };
 
@@ -956,6 +986,8 @@ try
             std::size_t task_upward_settled_nodes = 0;
             std::size_t task_downward_updates = 0;
             std::int64_t task_phast_elapsed_ms = 0;
+            std::int64_t task_upward_elapsed_ms = 0;
+            std::int64_t task_downward_elapsed_ms = 0;
 
             if (!run_phast_task(task_runtime,
                                 task_distances,
@@ -963,7 +995,9 @@ try
                                 task_seed_stats,
                                 task_upward_settled_nodes,
                                 task_downward_updates,
-                                task_phast_elapsed_ms))
+                                task_phast_elapsed_ms,
+                                task_upward_elapsed_ms,
+                                task_downward_elapsed_ms))
             {
                 return EXIT_FAILURE;
             }
@@ -1008,13 +1042,17 @@ try
     std::size_t upward_settled_nodes = 0;
     std::size_t downward_updates = 0;
     std::int64_t phast_elapsed = 0;
+    std::int64_t upward_elapsed_ms = 0;
+    std::int64_t downward_elapsed_ms = 0;
     if (!run_phast_task(runtime_config,
                         phast_distances,
                         cap_metric,
                         seed_stats,
                         upward_settled_nodes,
                         downward_updates,
-                        phast_elapsed))
+                        phast_elapsed,
+                        upward_elapsed_ms,
+                        downward_elapsed_ms))
     {
         return EXIT_FAILURE;
     }
@@ -1040,6 +1078,8 @@ try
                 << ", max distance: " << osrm::contractor::phast::MaxDistance(phast_distances)
                 << " ticks";
     util::Log() << "PHAST runtime: " << phast_elapsed << " ms";
+    util::Log() << "[timing] upward search (cap-bounded): " << upward_elapsed_ms << " ms";
+    util::Log() << "[timing] downward sweep (whole-graph): " << downward_elapsed_ms << " ms";
 
     if (runtime_config.has_raster_output_path)
     {
@@ -1060,6 +1100,7 @@ try
         std::size_t unreachable_cells = 0;
         std::size_t bytes_written = 0;
 
+        const auto t_raster_start = std::chrono::steady_clock::now();
         if (!writeDenseU16ArtifactFromSnapCache(runtime_config.sample_snap_cache,
                                                 runtime_config.expected_resolution,
                                                 phast_data.connectivity_checksum,
@@ -1076,6 +1117,8 @@ try
         {
             return EXIT_FAILURE;
         }
+        util::Log() << "[timing] rasterize (snap-cache -> u16): "
+                    << ms_between(t_raster_start, std::chrono::steady_clock::now()) << " ms";
 
         util::Log() << "Rasterized cells: " << cell_count;
         util::Log() << "Reachable cells: " << reachable_cells;
