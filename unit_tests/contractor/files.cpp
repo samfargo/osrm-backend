@@ -72,6 +72,18 @@ BOOST_AUTO_TEST_CASE(read_write_phast)
     TemporaryFile tmp{TEST_DATA_DIR "/read_write_phast_test.osrm.phast"};
     contractor::files::writePhast(tmp.path, reference);
 
+    PhastData metadata;
+    contractor::files::readPhastMetadata(tmp.path, metadata);
+    BOOST_CHECK_EQUAL(metadata.version, reference.version);
+    BOOST_CHECK_EQUAL(metadata.connectivity_checksum, reference.connectivity_checksum);
+    BOOST_CHECK_EQUAL(metadata.node_count, reference.node_count);
+    BOOST_CHECK_EQUAL(metadata.exclude_index, reference.exclude_index);
+    BOOST_CHECK_EQUAL(metadata.metric_name, reference.metric_name);
+    BOOST_CHECK_EQUAL(static_cast<std::uint32_t>(metadata.orientation),
+                      static_cast<std::uint32_t>(reference.orientation));
+    BOOST_CHECK(metadata.ordering.order.empty());
+    BOOST_CHECK(metadata.ordering.rank.empty());
+
     PhastData result;
     contractor::files::readPhast(tmp.path, result);
 

@@ -63,7 +63,9 @@ inline void write(storage::tar::FileWriter &writer, const std::string &name, con
                                   data.ordering.original_to_contraction);
 }
 
-inline void read(storage::tar::FileReader &reader, const std::string &name, PhastData &data)
+inline void readMetadata(storage::tar::FileReader &reader,
+                         const std::string &name,
+                         PhastData &data)
 {
     std::uint32_t orientation = 0;
     reader.ReadInto(name + "/version.meta", data.version);
@@ -73,6 +75,11 @@ inline void read(storage::tar::FileReader &reader, const std::string &name, Phas
     reader.ReadInto(name + "/orientation.meta", orientation);
     data.orientation = static_cast<PHASTOrientation>(orientation);
     storage::serialization::read(reader, name + "/metric_name", data.metric_name);
+}
+
+inline void read(storage::tar::FileReader &reader, const std::string &name, PhastData &data)
+{
+    readMetadata(reader, name, data);
     storage::serialization::read(reader, name + "/order", data.ordering.order);
     storage::serialization::read(reader, name + "/rank", data.ordering.rank);
     storage::serialization::read(reader,

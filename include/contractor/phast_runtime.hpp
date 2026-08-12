@@ -58,7 +58,8 @@ bool ResolveOrientation(const RuntimeConfig &runtime_config,
 bool LoadCHFacade(const std::filesystem::path &base_path,
                   const std::string &metric_name,
                   std::size_t exclude_index,
-                  std::shared_ptr<const CHDataFacade> &facade);
+                  std::shared_ptr<const CHDataFacade> &facade,
+                  bool use_mmap = false);
 
 bool ValidateFacadeMetadata(const CHDataFacade &facade,
                             const contractor::PhastData &phast_data,

@@ -1,3 +1,5 @@
+#include "contractor/ordinal_identity.hpp"
+
 #include "engine/approach.hpp"
 #include "engine/datafacade/contiguous_internalmem_datafacade.hpp"
 #include "engine/datafacade/process_memory_allocator.hpp"
@@ -42,6 +44,8 @@ using namespace osrm;
 
 namespace
 {
+using OrdinalsIdentity = osrm::contractor::phast::OrdinalsIdentity;
+
 struct RasterizeConfig final : storage::IOConfig
 {
     RasterizeConfig() : IOConfig({".osrm.hsgr", ".osrm.properties"}, {}, {}) {}
@@ -132,14 +136,6 @@ struct SampleSnapCacheHeader
     std::uint32_t connectivity_checksum = 0;
     std::uint32_t expected_resolution = 0;
     std::uint32_t reserved = 0;
-    std::uint64_t sample_count = 0;
-    std::uint64_t ordinals_file_size = 0;
-    std::uint64_t ordinals_hash_hi = 0;
-    std::uint64_t ordinals_hash_lo = 0;
-};
-
-struct OrdinalsIdentity
-{
     std::uint64_t sample_count = 0;
     std::uint64_t ordinals_file_size = 0;
     std::uint64_t ordinals_hash_hi = 0;
@@ -789,6 +785,13 @@ bool ensureSampleSnapCache(const CHDataFacade &facade,
     if (!loadOrdinalsIdentityAndCoordinates(
             sample_ordinals_path, expected_resolution, ordinals_identity, sample_coordinates))
     {
+        return false;
+    }
+    std::string identity_error;
+    if (!osrm::contractor::phast::WriteOrdinalsIdentity(
+            sample_ordinals_path, expected_resolution, ordinals_identity, identity_error))
+    {
+        util::Log(logERROR) << identity_error;
         return false;
     }
     sample_count = ordinals_identity.sample_count;

@@ -57,6 +57,14 @@ inline void readPhast(const std::filesystem::path &path, PhastData &data)
     serialization::read(reader, "/phast", data);
 }
 
+inline void readPhastMetadata(const std::filesystem::path &path, PhastData &data)
+{
+    const auto fingerprint = storage::tar::FileReader::VerifyFingerprint;
+    storage::tar::FileReader reader{path, fingerprint};
+
+    serialization::readMetadata(reader, "/phast", data);
+}
+
 inline void writePhast(const std::filesystem::path &path, const PhastData &data)
 {
     const auto fingerprint = storage::tar::FileWriter::GenerateFingerprint;

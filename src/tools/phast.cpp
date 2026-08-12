@@ -1,5 +1,7 @@
 #include "contractor/contracted_metric.hpp"
 #include "contractor/files.hpp"
+#include "contractor/iso_adj.hpp"
+#include "contractor/ordinal_identity.hpp"
 #include "contractor/phast_cap.hpp"
 #include "contractor/phast_cli.hpp"
 #include "contractor/phast_io.hpp"
@@ -16,14 +18,17 @@
 #include "util/log.hpp"
 #include "util/meminfo.hpp"
 
+#include <boost/iostreams/device/mapped_file.hpp>
 #include <boost/uuid/detail/sha1.hpp>
 #include <h3api.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -33,13 +38,21 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 
 using namespace osrm;
 
 namespace
 {
+using OrdinalsIdentity = osrm::contractor::phast::OrdinalsIdentity;
+
 constexpr std::uint32_t SAMPLE_SNAP_CACHE_VERSION = 2;
 constexpr std::array<char, 8> SAMPLE_SNAP_CACHE_MAGIC = {'P', 'H', 'S', 'N', 'A', 'P', '2', '\0'};
 constexpr std::uint16_t MAX_REACHABLE_U16_INT = 65534;
@@ -51,14 +64,6 @@ struct SampleSnapCacheHeader
     std::uint32_t connectivity_checksum = 0;
     std::uint32_t expected_resolution = 0;
     std::uint32_t reserved = 0;
-    std::uint64_t sample_count = 0;
-    std::uint64_t ordinals_file_size = 0;
-    std::uint64_t ordinals_hash_hi = 0;
-    std::uint64_t ordinals_hash_lo = 0;
-};
-
-struct OrdinalsIdentity
-{
     std::uint64_t sample_count = 0;
     std::uint64_t ordinals_file_size = 0;
     std::uint64_t ordinals_hash_hi = 0;
@@ -96,8 +101,9 @@ struct BatchRasterTask
 
 struct LoadedSampleSnapCache
 {
-    std::uint64_t sample_count = 0;
-    std::vector<SamplePrimaryHint> hints;
+    boost::iostreams::mapped_file_source file;
+    std::size_t sample_count = 0;
+    const char *records = nullptr;
 };
 
 constexpr std::uint8_t SAMPLE_HINT_HAS_FORWARD = 1U << 0;
@@ -105,6 +111,11 @@ constexpr std::uint8_t SAMPLE_HINT_FORWARD_OFFSET_VALID = 1U << 1;
 constexpr std::uint8_t SAMPLE_HINT_HAS_REVERSE = 1U << 2;
 constexpr std::uint8_t SAMPLE_HINT_REVERSE_OFFSET_VALID = 1U << 3;
 constexpr std::size_t SAMPLE_HINT_RECORD_BYTES = 28;
+constexpr std::size_t SAMPLE_SNAP_CACHE_HEADER_BYTES =
+    SAMPLE_SNAP_CACHE_MAGIC.size() + sizeof(std::uint32_t) * 4 + sizeof(std::uint64_t) * 4;
+constexpr std::size_t RASTER_CHUNK_RECORDS = 1U << 18;
+constexpr std::size_t RASTER_PARALLEL_MIN_RECORDS = RASTER_CHUNK_RECORDS * 8;
+constexpr std::size_t MAX_RASTER_THREADS = 4;
 
 template <typename T> bool writeBinary(std::ostream &output, const T &value)
 {
@@ -135,23 +146,21 @@ bool readSnapCacheHeader(std::istream &input, SampleSnapCacheHeader &header)
            readBinary(input, header.ordinals_hash_hi) && readBinary(input, header.ordinals_hash_lo);
 }
 
-bool readPrimaryHintRecord(std::istream &input, SamplePrimaryHint &hint)
+template <typename T> T readUnaligned(const char *bytes)
 {
-    std::int32_t ignored_lon = 0;
-    std::int32_t ignored_lat = 0;
-    std::int32_t forward_offset_ticks = 0;
-    std::int32_t reverse_offset_ticks = 0;
-    std::uint8_t flags = 0;
-    std::uint8_t reserved0 = 0;
-    std::uint16_t reserved1 = 0;
+    T value;
+    std::memcpy(&value, bytes, sizeof(value));
+    return value;
+}
 
-    if (!readBinary(input, ignored_lon) || !readBinary(input, ignored_lat) ||
-        !readBinary(input, hint.forward_node_id) || !readBinary(input, hint.reverse_node_id) ||
-        !readBinary(input, forward_offset_ticks) || !readBinary(input, reverse_offset_ticks) ||
-        !readBinary(input, flags) || !readBinary(input, reserved0) || !readBinary(input, reserved1))
-    {
-        return false;
-    }
+SamplePrimaryHint readPrimaryHintRecord(const char *record)
+{
+    SamplePrimaryHint hint;
+    hint.forward_node_id = readUnaligned<std::uint32_t>(record + 8);
+    hint.reverse_node_id = readUnaligned<std::uint32_t>(record + 12);
+    const auto forward_offset_ticks = readUnaligned<std::int32_t>(record + 16);
+    const auto reverse_offset_ticks = readUnaligned<std::int32_t>(record + 20);
+    const auto flags = readUnaligned<std::uint8_t>(record + 24);
 
     hint.has_forward_state = (flags & SAMPLE_HINT_HAS_FORWARD) != 0;
     hint.forward_offset_valid = (flags & SAMPLE_HINT_FORWARD_OFFSET_VALID) != 0;
@@ -159,7 +168,7 @@ bool readPrimaryHintRecord(std::istream &input, SamplePrimaryHint &hint)
     hint.reverse_offset_valid = (flags & SAMPLE_HINT_REVERSE_OFFSET_VALID) != 0;
     hint.forward_offset = to_alias<EdgeWeight>(static_cast<std::int64_t>(forward_offset_ticks));
     hint.reverse_offset = to_alias<EdgeWeight>(static_cast<std::int64_t>(reverse_offset_ticks));
-    return true;
+    return hint;
 }
 
 std::uint64_t decodeLittleEndianU64(const unsigned char *bytes)
@@ -197,7 +206,7 @@ sha1DigestToBytes(const boost::uuids::detail::sha1::digest_type &digest)
     return bytes;
 }
 
-bool loadOrdinalsIdentity(const std::filesystem::path &sample_ordinals_path,
+bool scanOrdinalsIdentity(const std::filesystem::path &sample_ordinals_path,
                           const std::uint32_t expected_resolution,
                           OrdinalsIdentity &identity)
 {
@@ -279,6 +288,38 @@ bool loadOrdinalsIdentity(const std::filesystem::path &sample_ordinals_path,
     identity.ordinals_file_size = ordinals_file_size;
     identity.ordinals_hash_hi = loadBigEndianU64(digest_bytes.data());
     identity.ordinals_hash_lo = loadBigEndianU64(digest_bytes.data() + 8);
+    return true;
+}
+
+bool loadOrdinalsIdentity(const std::filesystem::path &sample_ordinals_path,
+                          const std::uint32_t expected_resolution,
+                          const bool validate_contents,
+                          OrdinalsIdentity &identity)
+{
+    std::string error;
+    if (!osrm::contractor::phast::ReadOrdinalsIdentity(
+            sample_ordinals_path, expected_resolution, identity, error))
+    {
+        util::Log(logERROR) << error
+                            << ". Rebuild the sample snap cache to create a trusted identity.";
+        return false;
+    }
+    if (!validate_contents)
+    {
+        return true;
+    }
+
+    OrdinalsIdentity scanned_identity;
+    if (!scanOrdinalsIdentity(sample_ordinals_path, expected_resolution, scanned_identity))
+    {
+        return false;
+    }
+    if (!(scanned_identity == identity))
+    {
+        util::Log(logERROR) << "Ordinal contents do not match identity: "
+                            << sample_ordinals_path.string();
+        return false;
+    }
     return true;
 }
 
@@ -444,6 +485,8 @@ bool writeStatsMetadata(const std::filesystem::path &output_path,
                         const std::size_t reachable_cells,
                         const std::size_t unreachable_cells,
                         const std::size_t bytes_written,
+                        const std::int64_t traversal_ms,
+                        const std::int64_t rasterization_ms,
                         const RasterizationStats &rasterization_stats)
 {
     auto metadata_path = output_path;
@@ -462,6 +505,8 @@ bool writeStatsMetadata(const std::filesystem::path &output_path,
              << "\"reachable_cells\":" << reachable_cells << ","
              << "\"unreachable_cells\":" << unreachable_cells << ","
              << "\"bytes\":" << bytes_written << ","
+             << "\"traversal_ms\":" << traversal_ms << ","
+             << "\"rasterization_ms\":" << rasterization_ms << ","
              << "\"mapped_samples\":" << rasterization_stats.mapped_samples << ","
              << "\"no_candidate_samples\":" << rasterization_stats.no_candidate_samples << ","
              << "\"no_valid_state_samples\":" << rasterization_stats.no_valid_state_samples << ","
@@ -493,12 +538,26 @@ bool writeStatsMetadata(const std::filesystem::path &output_path,
     return true;
 }
 
+void adviseSequential(const char *data, const std::size_t size)
+{
+#if defined(MADV_SEQUENTIAL)
+    if (size > 0)
+    {
+        (void)::madvise(const_cast<char *>(data), size, MADV_SEQUENTIAL);
+    }
+#else
+    (void)data;
+    (void)size;
+#endif
+}
+
 bool loadSampleSnapCache(const std::filesystem::path &sample_cache_path,
                          const std::uint32_t expected_resolution,
                          const std::uint32_t connectivity_checksum,
                          const OrdinalsIdentity &ordinals_identity,
                          LoadedSampleSnapCache &loaded_cache)
 {
+    const auto load_started = std::chrono::steady_clock::now();
     std::ifstream cache_input(sample_cache_path, std::ios::binary);
     if (!cache_input)
     {
@@ -524,9 +583,18 @@ bool loadSampleSnapCache(const std::filesystem::path &sample_cache_path,
         return false;
     }
 
-    const auto expected_size = SAMPLE_SNAP_CACHE_MAGIC.size() + sizeof(std::uint32_t) * 4 +
-                               sizeof(std::uint64_t) * 4 +
-                               header.sample_count * SAMPLE_HINT_RECORD_BYTES;
+    if (header.sample_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+        static_cast<std::size_t>(header.sample_count) >
+            (std::numeric_limits<std::size_t>::max() - SAMPLE_SNAP_CACHE_HEADER_BYTES) /
+                SAMPLE_HINT_RECORD_BYTES)
+    {
+        util::Log(logERROR) << "Sample snap cache sample_count does not fit into size_t.";
+        return false;
+    }
+
+    const auto sample_count = static_cast<std::size_t>(header.sample_count);
+    const auto expected_size =
+        SAMPLE_SNAP_CACHE_HEADER_BYTES + sample_count * SAMPLE_HINT_RECORD_BYTES;
     std::error_code cache_size_error;
     const auto actual_size = std::filesystem::file_size(sample_cache_path, cache_size_error);
     if (cache_size_error || actual_size != expected_size)
@@ -535,25 +603,34 @@ bool loadSampleSnapCache(const std::filesystem::path &sample_cache_path,
         return false;
     }
 
-    if (header.sample_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+    cache_input.close();
+    loaded_cache.file.close();
+    try
     {
-        util::Log(logERROR) << "Sample snap cache sample_count does not fit into size_t.";
+        loaded_cache.file.open(sample_cache_path.string());
+    }
+    catch (const std::exception &e)
+    {
+        util::Log(logERROR) << "Failed to mmap sample snap cache " << sample_cache_path.string()
+                            << ": " << e.what();
+        return false;
+    }
+    if (!loaded_cache.file.is_open() || loaded_cache.file.size() != expected_size)
+    {
+        util::Log(logERROR) << "Could not mmap complete sample snap cache: "
+                            << sample_cache_path.string();
         return false;
     }
 
-    loaded_cache.sample_count = header.sample_count;
-    loaded_cache.hints.clear();
-    loaded_cache.hints.reserve(static_cast<std::size_t>(header.sample_count));
-    for (const auto index : util::irange<std::uint64_t>(0, header.sample_count))
-    {
-        SamplePrimaryHint hint;
-        if (!readPrimaryHintRecord(cache_input, hint))
-        {
-            util::Log(logERROR) << "Failed reading sample snap cache record at index " << index;
-            return false;
-        }
-        loaded_cache.hints.push_back(hint);
-    }
+    adviseSequential(loaded_cache.file.data(), loaded_cache.file.size());
+    loaded_cache.sample_count = sample_count;
+    loaded_cache.records = loaded_cache.file.data() + SAMPLE_SNAP_CACHE_HEADER_BYTES;
+
+    const auto load_done = std::chrono::steady_clock::now();
+    util::Log() << "Sample snap cache mmap load: "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(load_done - load_started)
+                       .count()
+                << " ms, records=" << loaded_cache.sample_count;
 
     return true;
 }
@@ -562,6 +639,7 @@ bool writeDenseU16ArtifactFromHints(const LoadedSampleSnapCache &loaded_cache,
                                     const std::string &metric_name,
                                     const std::optional<EdgeWeight> cap_metric,
                                     const std::vector<EdgeWeight> &costs,
+                                    const std::int64_t traversal_ms,
                                     const std::filesystem::path &raster_output_path,
                                     RasterizationStats &stats,
                                     std::size_t &cell_count,
@@ -569,96 +647,188 @@ bool writeDenseU16ArtifactFromHints(const LoadedSampleSnapCache &loaded_cache,
                                     std::size_t &unreachable_cells,
                                     std::size_t &bytes_written)
 {
+    const auto raster_started = std::chrono::steady_clock::now();
     auto output_tmp = raster_output_path;
     output_tmp += ".tmp";
-    std::ofstream output(output_tmp, std::ios::binary | std::ios::trunc);
-    if (!output)
-    {
-        util::Log(logERROR) << "Could not open output artifact path: " << output_tmp.string();
-        return false;
-    }
 
     stats = {};
-    cell_count = loaded_cache.hints.size();
+    cell_count = loaded_cache.sample_count;
     reachable_cells = 0;
     unreachable_cells = 0;
-    bytes_written = 0;
-    std::size_t primary_hint_miss_count = 0;
+    bytes_written = cell_count * sizeof(std::uint16_t);
 
-    for (const auto &hint : loaded_cache.hints)
+    std::error_code remove_tmp_error;
+    std::filesystem::remove(output_tmp, remove_tmp_error);
+    if (remove_tmp_error)
     {
-        EdgeWeight mapped_cost = INVALID_EDGE_WEIGHT;
-        if (!mapSampleFromPrimaryHint(hint, costs, mapped_cost, stats))
-        {
-            return false;
-        }
-        if (mapped_cost == INVALID_EDGE_WEIGHT)
-        {
-            ++primary_hint_miss_count;
-            ++stats.no_candidate_samples;
-        }
-
-        std::uint16_t encoded = UNREACHABLE_U16_INT;
-        if (mapped_cost == INVALID_EDGE_WEIGHT)
-        {
-            ++unreachable_cells;
-        }
-        else if (cap_metric.has_value() && mapped_cost > cap_metric.value())
-        {
-            ++stats.capped_samples;
-            ++unreachable_cells;
-        }
-        else
-        {
-            const auto ticks = from_alias<std::int64_t>(mapped_cost);
-            double seconds = static_cast<double>(ticks);
-            if (metric_name == "duration")
-            {
-                seconds = ticks / 10.0;
-            }
-            const auto rounded = std::nearbyint(seconds);
-            if (!std::isfinite(rounded) || rounded < 0.0)
-            {
-                ++unreachable_cells;
-            }
-            else
-            {
-                const auto clipped =
-                    std::min<double>(rounded, static_cast<double>(MAX_REACHABLE_U16_INT));
-                encoded = static_cast<std::uint16_t>(clipped);
-                ++reachable_cells;
-            }
-        }
-
-        const char bytes[2] = {
-            static_cast<char>(encoded & 0xFF),
-            static_cast<char>((encoded >> 8) & 0xFF),
-        };
-        output.write(bytes, sizeof(bytes));
-        if (!output.good())
-        {
-            util::Log(logERROR) << "Failed writing raster artifact bytes: " << output_tmp.string();
-            return false;
-        }
-    }
-
-    output.close();
-    if (!output)
-    {
-        util::Log(logERROR) << "Failed flushing raster artifact: " << output_tmp.string();
+        util::Log(logERROR) << "Could not remove stale raster temp file " << output_tmp.string()
+                            << ": " << remove_tmp_error.message();
         return false;
     }
 
-    if (primary_hint_miss_count > 0)
+    boost::iostreams::mapped_file mapped_output;
+    try
     {
-        util::Log(logWARNING) << "Primary snap hint could not map " << primary_hint_miss_count
+        boost::iostreams::mapped_file_params params;
+        params.path = output_tmp.string();
+        params.flags = boost::iostreams::mapped_file::readwrite;
+        params.new_file_size = bytes_written;
+        mapped_output.open(params);
+    }
+    catch (const std::exception &e)
+    {
+        util::Log(logERROR) << "Failed to mmap raster temp file " << output_tmp.string() << ": "
+                            << e.what();
+        std::error_code cleanup_error;
+        std::filesystem::remove(output_tmp, cleanup_error);
+        return false;
+    }
+    if (!mapped_output.is_open() || mapped_output.size() != bytes_written)
+    {
+        util::Log(logERROR) << "Could not mmap complete raster temp file: " << output_tmp.string();
+        mapped_output.close();
+        std::error_code cleanup_error;
+        std::filesystem::remove(output_tmp, cleanup_error);
+        return false;
+    }
+    adviseSequential(mapped_output.data(), mapped_output.size());
+    auto *const output_data = mapped_output.data();
+
+    struct ThreadResult
+    {
+        RasterizationStats stats;
+        std::size_t reachable_cells = 0;
+        std::size_t unreachable_cells = 0;
+    };
+
+    const auto hardware_threads =
+        static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
+    const auto available_chunks =
+        std::max<std::size_t>(1, (cell_count + RASTER_CHUNK_RECORDS - 1) / RASTER_CHUNK_RECORDS);
+    const auto worker_count = cell_count < RASTER_PARALLEL_MIN_RECORDS
+                                  ? std::size_t{1}
+                                  : std::min({MAX_RASTER_THREADS, hardware_threads, available_chunks});
+    const auto records_per_worker = (cell_count + worker_count - 1) / worker_count;
+    const bool duration_metric = metric_name == "duration";
+    std::vector<ThreadResult> thread_results(worker_count);
+    std::atomic<bool> failed{false};
+
+    auto rasterize_range = [&](const std::size_t worker_index)
+    {
+        ThreadResult result;
+        const auto begin = worker_index * records_per_worker;
+        const auto end = std::min(cell_count, begin + records_per_worker);
+        for (auto chunk_begin = begin; chunk_begin < end && !failed.load(std::memory_order_relaxed);
+             chunk_begin += RASTER_CHUNK_RECORDS)
+        {
+            const auto chunk_end = std::min(end, chunk_begin + RASTER_CHUNK_RECORDS);
+            for (auto index = chunk_begin; index < chunk_end; ++index)
+            {
+                const auto hint = readPrimaryHintRecord(
+                    loaded_cache.records + index * SAMPLE_HINT_RECORD_BYTES);
+                EdgeWeight mapped_cost = INVALID_EDGE_WEIGHT;
+                if (!mapSampleFromPrimaryHint(hint, costs, mapped_cost, result.stats))
+                {
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                if (mapped_cost == INVALID_EDGE_WEIGHT)
+                {
+                    ++result.stats.no_candidate_samples;
+                }
+
+                std::uint16_t encoded = UNREACHABLE_U16_INT;
+                if (mapped_cost == INVALID_EDGE_WEIGHT)
+                {
+                    ++result.unreachable_cells;
+                }
+                else if (cap_metric.has_value() && mapped_cost > cap_metric.value())
+                {
+                    ++result.stats.capped_samples;
+                    ++result.unreachable_cells;
+                }
+                else
+                {
+                    const auto ticks = from_alias<std::int64_t>(mapped_cost);
+                    const auto seconds = duration_metric ? static_cast<double>(ticks) / 10.0
+                                                         : static_cast<double>(ticks);
+                    const auto rounded = std::nearbyint(seconds);
+                    if (!std::isfinite(rounded) || rounded < 0.0)
+                    {
+                        ++result.unreachable_cells;
+                    }
+                    else
+                    {
+                        const auto clipped =
+                            std::min<double>(rounded, static_cast<double>(MAX_REACHABLE_U16_INT));
+                        encoded = static_cast<std::uint16_t>(clipped);
+                        ++result.reachable_cells;
+                    }
+                }
+
+                auto *output = output_data + index * sizeof(std::uint16_t);
+                output[0] = static_cast<char>(encoded & 0xFF);
+                output[1] = static_cast<char>((encoded >> 8) & 0xFF);
+            }
+        }
+        thread_results[worker_index] = result;
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try
+    {
+        for (const auto worker_index : util::irange<std::size_t>(1, worker_count))
+        {
+            workers.emplace_back(rasterize_range, worker_index);
+        }
+    }
+    catch (const std::exception &e)
+    {
+        failed.store(true, std::memory_order_relaxed);
+        for (auto &worker : workers)
+        {
+            worker.join();
+        }
+        util::Log(logERROR) << "Failed to start raster worker: " << e.what();
+        mapped_output.close();
+        std::error_code cleanup_error;
+        std::filesystem::remove(output_tmp, cleanup_error);
+        return false;
+    }
+    rasterize_range(0);
+    for (auto &worker : workers)
+    {
+        worker.join();
+    }
+
+    for (const auto &result : thread_results)
+    {
+        stats.mapped_samples += result.stats.mapped_samples;
+        stats.no_candidate_samples += result.stats.no_candidate_samples;
+        stats.no_valid_state_samples += result.stats.no_valid_state_samples;
+        stats.unreachable_state_samples += result.stats.unreachable_state_samples;
+        stats.capped_samples += result.stats.capped_samples;
+        reachable_cells += result.reachable_cells;
+        unreachable_cells += result.unreachable_cells;
+    }
+
+    if (failed.load(std::memory_order_relaxed))
+    {
+        util::Log(logERROR) << "Failed rasterizing raster artifact: " << output_tmp.string();
+        mapped_output.close();
+        std::error_code cleanup_error;
+        std::filesystem::remove(output_tmp, cleanup_error);
+        return false;
+    }
+    mapped_output.close();
+
+    if (stats.no_candidate_samples > 0)
+    {
+        util::Log(logWARNING) << "Primary snap hint could not map " << stats.no_candidate_samples
                               << " samples; they were marked unreachable.";
     }
 
-    bytes_written = loaded_cache.hints.size() * sizeof(std::uint16_t);
-    std::error_code remove_error;
-    std::filesystem::remove(raster_output_path, remove_error);
-    (void)remove_error;
     std::error_code rename_error;
     std::filesystem::rename(output_tmp, raster_output_path, rename_error);
     if (rename_error)
@@ -671,11 +841,20 @@ bool writeDenseU16ArtifactFromHints(const LoadedSampleSnapCache &loaded_cache,
         return false;
     }
 
+    const auto raster_done = std::chrono::steady_clock::now();
+    const auto rasterization_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(raster_done - raster_started).count();
+    util::Log() << "Snap cache rasterization: "
+                << rasterization_ms
+                << " ms, workers=" << worker_count << ", chunk_records=" << RASTER_CHUNK_RECORDS;
+
     if (!writeStatsMetadata(raster_output_path,
                             cell_count,
                             reachable_cells,
                             unreachable_cells,
                             bytes_written,
+                            traversal_ms,
+                            rasterization_ms,
                             stats))
     {
         return false;
@@ -691,6 +870,7 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
                                         const std::string &metric_name,
                                         const std::optional<EdgeWeight> cap_metric,
                                         const std::vector<EdgeWeight> &costs,
+                                        const std::int64_t traversal_ms,
                                         const std::filesystem::path &raster_output_path,
                                         RasterizationStats &stats,
                                         std::size_t &cell_count,
@@ -711,6 +891,7 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
                                           metric_name,
                                           cap_metric,
                                           costs,
+                                          traversal_ms,
                                           raster_output_path,
                                           stats,
                                           cell_count,
@@ -718,17 +899,194 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
                                           unreachable_cells,
                                           bytes_written);
 }
+
+// ---------------------------------------------------------------------------
+// Lean custom-isochrone path (--iso-adj): capped Dijkstra over a memory-mapped
+// edge-based adjacency. Reuses the proven source snapping (BuildSeeds via an
+// mmap'd facade) and the dense-u16 rasterizer, replacing only the whole-graph
+// PHAST sweep with a region-bounded Dijkstra. See src/tools/iso_adj.cpp for the
+// exporter and the on-disk format.
+// ---------------------------------------------------------------------------
+
+bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
+                   const osrm::contractor::phast::RuntimeConfig &runtime_config)
+{
+    namespace phast = osrm::contractor::phast;
+
+    extractor::ProfileProperties properties;
+    extractor::files::readProfileProperties(phast_config.GetPath(".osrm.properties"), properties);
+    const std::string metric_name = properties.GetWeightName();
+
+    phast::MetricKind runtime_metric_kind = phast::MetricKind::Weight;
+    if (!phast::ParseMetricKind(runtime_config.metric, metric_name, "--metric", runtime_metric_kind))
+    {
+        return false;
+    }
+    phast::MetricKind seed_metric_kind = phast::MetricKind::Weight;
+    if (!phast::ParseMetricKind(
+            runtime_config.seed_metric, metric_name, "--seed-metric", seed_metric_kind))
+    {
+        return false;
+    }
+    if (seed_metric_kind != runtime_metric_kind && metric_name != "duration")
+    {
+        util::Log(logERROR) << "--seed-metric must match --metric unless weight_name=duration.";
+        return false;
+    }
+
+    phast::IsoAdj adj;
+    if (!phast::LoadIsoAdj(runtime_config.iso_adj_path, adj))
+    {
+        return false;
+    }
+    const auto &metadata = adj.metadata;
+    if (metadata.metric_name != metric_name)
+    {
+        util::Log(logERROR) << "Metric name mismatch between .osrm.properties and iso-adj.";
+        return false;
+    }
+    if (metadata.metric_kind != runtime_metric_kind)
+    {
+        util::Log(logERROR) << "iso-adj metric kind differs from --metric.";
+        return false;
+    }
+
+    const std::size_t selected_exclude_index = metadata.exclude_index;
+    if (runtime_config.has_exclude_index &&
+        runtime_config.exclude_index != selected_exclude_index)
+    {
+        util::Log(logERROR) << "--exclude=" << runtime_config.exclude_index
+                            << " does not match iso-adj exclude index "
+                            << selected_exclude_index << ".";
+        return false;
+    }
+    if (selected_exclude_index >= properties.excludable_classes.size())
+    {
+        util::Log(logERROR) << "iso-adj exclude index " << selected_exclude_index
+                            << " is out of range for this profile.";
+        return false;
+    }
+
+    const auto selected_orientation = metadata.orientation;
+    if (runtime_config.has_orientation &&
+        runtime_config.orientation != phast::OrientationToString(selected_orientation))
+    {
+        util::Log(logERROR) << "--orientation=" << runtime_config.orientation
+                            << " does not match iso-adj orientation "
+                            << phast::OrientationToString(selected_orientation) << ".";
+        return false;
+    }
+
+    // Snapping only: mmap the facade so the CH graph (.hsgr) is mapped but never
+    // faulted in; the rtree + geometry pages touched by BuildSeeds stay tiny.
+    std::shared_ptr<const phast::CHDataFacade> facade;
+    if (!phast::LoadCHFacade(phast_config.base_path,
+                             metric_name,
+                             selected_exclude_index,
+                             facade,
+                             /*use_mmap=*/true))
+    {
+        return false;
+    }
+    if (facade->GetCheckSum() != metadata.connectivity_checksum)
+    {
+        util::Log(logERROR) << "Facade connectivity checksum (" << facade->GetCheckSum()
+                            << ") differs from iso-adj (" << metadata.connectivity_checksum
+                            << "). Re-export osrm-iso-adj for this dataset.";
+        return false;
+    }
+    if (facade->GetNumberOfNodes() != metadata.node_count)
+    {
+        util::Log(logERROR) << "Facade node count (" << facade->GetNumberOfNodes()
+                            << ") differs from iso-adj (" << metadata.node_count << ").";
+        return false;
+    }
+    if (std::string{facade->GetWeightName()} != metadata.metric_name)
+    {
+        util::Log(logERROR) << "Facade weight name differs from iso-adj.";
+        return false;
+    }
+    if (phast::BuildIsoAdjBuildID(facade->GetTimestamp(), metadata) != metadata.build_id)
+    {
+        util::Log(logERROR)
+            << "iso-adj build identity differs from the loaded OSRM base. Re-export it.";
+        return false;
+    }
+
+    OrdinalsIdentity ordinals_identity;
+    if (!loadOrdinalsIdentity(
+            runtime_config.sample_ordinals,
+            runtime_config.expected_resolution,
+            runtime_config.validate_sample_ordinals,
+            ordinals_identity))
+    {
+        return false;
+    }
+
+    std::vector<phast::PHASTSeed> seeds;
+    phast::SeedBuildStats seed_stats;
+    if (!phast::BuildSeeds(runtime_config,
+                           static_cast<std::uint32_t>(metadata.node_count),
+                           seed_metric_kind,
+                           selected_orientation,
+                           *facade,
+                           seeds,
+                           seed_stats) ||
+        !phast::ValidateSeeds(static_cast<std::uint32_t>(metadata.node_count), seeds))
+    {
+        return false;
+    }
+
+    std::optional<EdgeWeight> cap_metric;
+    if (!phast::ParseTraversalCap(runtime_config, properties, runtime_metric_kind, cap_metric))
+    {
+        return false;
+    }
+
+    const auto t_search_start = std::chrono::steady_clock::now();
+    std::vector<EdgeWeight> distances;
+    phast::RunCappedDijkstraIsoAdj(adj, seeds, cap_metric, distances);
+    const auto t_search_done = std::chrono::steady_clock::now();
+    const auto search_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t_search_done - t_search_start)
+            .count();
+    util::Log() << "[iso-adj] capped Dijkstra: " << search_ms
+                << " ms, reachable nodes: "
+                << osrm::contractor::phast::CountReachable(distances);
+
+    RasterizationStats stats;
+    std::size_t cell_count = 0;
+    std::size_t reachable_cells = 0;
+    std::size_t unreachable_cells = 0;
+    std::size_t bytes_written = 0;
+    if (!writeDenseU16ArtifactFromSnapCache(runtime_config.sample_snap_cache,
+                                            runtime_config.expected_resolution,
+                                            metadata.connectivity_checksum,
+                                            ordinals_identity,
+                                            metric_name,
+                                            cap_metric,
+                                            distances,
+                                            search_ms,
+                                            runtime_config.raster_output_path,
+                                            stats,
+                                            cell_count,
+                                            reachable_cells,
+                                            unreachable_cells,
+                                            bytes_written))
+    {
+        return false;
+    }
+
+    util::Log() << "[iso-adj] raster cells=" << cell_count << " reachable=" << reachable_cells
+                << " unreachable=" << unreachable_cells << " bytes=" << bytes_written;
+    return true;
+}
 } // namespace
 
 int main(int argc, char *argv[])
 try
 {
     util::LogPolicy::GetInstance().Unmute();
-
-    const auto ms_between = [](std::chrono::steady_clock::time_point a,
-                               std::chrono::steady_clock::time_point b) {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
-    };
 
     std::string verbosity;
     osrm::contractor::phast::PhastConfig phast_config;
@@ -747,14 +1105,20 @@ try
 
     util::LogPolicy::GetInstance().SetLevel(verbosity);
     phast_config.UseDefaultOutputNames(phast_config.base_path);
-    if (!phast_config.IsValid())
+    if (!runtime_config.has_iso_adj && !phast_config.IsValid())
     {
         return EXIT_FAILURE;
     }
 
     util::Log() << "Input file: " << phast_config.base_path.string() << ".osrm";
 
-    const auto t_load_start = std::chrono::steady_clock::now();
+    // Lean custom-isochrone path: capped Dijkstra over a memory-mapped edge-based
+    // adjacency. Skips the whole-graph CH load + PHAST sweep entirely; the
+    // existing batch/core path below is untouched.
+    if (runtime_config.has_iso_adj)
+    {
+        return RunIsoAdjMode(phast_config, runtime_config) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
 
     extractor::ProfileProperties properties;
     extractor::files::readProfileProperties(phast_config.GetPath(".osrm.properties"), properties);
@@ -766,8 +1130,6 @@ try
 
     osrm::contractor::PhastData phast_data;
     osrm::contractor::files::readPhast(phast_config.GetPath(".osrm.phast"), phast_data);
-
-    const auto t_graph_files_loaded = std::chrono::steady_clock::now();
 
     const auto &metric = metrics.at(metric_name);
     const auto &graph = metric.graph;
@@ -818,7 +1180,6 @@ try
         return EXIT_FAILURE;
     }
 
-    const auto t_before_facade = std::chrono::steady_clock::now();
     std::shared_ptr<const osrm::contractor::phast::CHDataFacade> facade;
     if (!osrm::contractor::phast::LoadCHFacade(
             phast_config.base_path, metric_name, selected_exclude_index, facade) ||
@@ -826,11 +1187,9 @@ try
     {
         return EXIT_FAILURE;
     }
-    const auto t_after_facade = std::chrono::steady_clock::now();
 
     const auto &selected_edge_filter = metric.edge_filter[selected_exclude_index];
     osrm::contractor::phast::DerivedAdjacency adjacency;
-    const auto t_before_adjacency = std::chrono::steady_clock::now();
     if (!osrm::contractor::phast::DeriveAdjacency(graph,
                                                   selected_edge_filter,
                                                   phast_data,
@@ -840,15 +1199,6 @@ try
     {
         return EXIT_FAILURE;
     }
-    const auto t_after_adjacency = std::chrono::steady_clock::now();
-
-    util::Log() << "[timing] graph files load (.properties/.hsgr/.phast): "
-                << ms_between(t_load_start, t_graph_files_loaded) << " ms";
-    util::Log() << "[timing] CH facade load: " << ms_between(t_before_facade, t_after_facade) << " ms";
-    util::Log() << "[timing] derive adjacency: " << ms_between(t_before_adjacency, t_after_adjacency)
-                << " ms";
-    util::Log() << "[timing] total graph load: " << ms_between(t_load_start, t_after_adjacency)
-                << " ms";
 
     auto run_phast_task = [&](const osrm::contractor::phast::RuntimeConfig &task_runtime,
                               std::vector<EdgeWeight> &task_distances,
@@ -856,9 +1206,7 @@ try
                               osrm::contractor::phast::SeedBuildStats &task_seed_stats,
                               std::size_t &task_upward_settled_nodes,
                               std::size_t &task_downward_updates,
-                              std::int64_t &task_phast_elapsed_ms,
-                              std::int64_t &task_upward_elapsed_ms,
-                              std::int64_t &task_downward_elapsed_ms) -> bool
+                              std::int64_t &task_phast_elapsed_ms) -> bool
     {
         std::vector<osrm::contractor::phast::PHASTSeed> task_seeds;
         if (!osrm::contractor::phast::BuildSeeds(task_runtime,
@@ -885,17 +1233,12 @@ try
         {
             return false;
         }
-        const auto upward_done = std::chrono::steady_clock::now();
         if (!osrm::contractor::phast::RunDownwardSweep(
                 phast_data, adjacency, task_cap_metric, task_distances, &task_downward_updates))
         {
             return false;
         }
         const auto downward_done = std::chrono::steady_clock::now();
-        task_upward_elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(upward_done - phast_started).count();
-        task_downward_elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(downward_done - upward_done).count();
         task_phast_elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(downward_done - phast_started).count();
         return true;
@@ -909,8 +1252,8 @@ try
     util::Log() << "Runtime orientation: "
                 << osrm::contractor::phast::OrientationToString(selected_orientation);
     util::Log() << "Runtime exclude index: " << selected_exclude_index;
-    util::Log() << "Pre-synthesis upward arcs: " << adjacency.pre_synthesis_upward_arc_count;
-    util::Log() << "Pre-synthesis downward arcs: " << adjacency.pre_synthesis_downward_arc_count;
+    util::Log() << "Runtime upward arcs: " << adjacency.pre_synthesis_upward_arc_count;
+    util::Log() << "Runtime downward arcs: " << adjacency.pre_synthesis_downward_arc_count;
     util::Log() << "Downward adjacency built from transpose: "
                 << (adjacency.downward_built_from_transpose ? "yes" : "no");
     util::Log() << "Derived upward arcs: " << adjacency.up_targets.size();
@@ -926,6 +1269,7 @@ try
         OrdinalsIdentity loaded_identity;
         if (!loadOrdinalsIdentity(runtime_config.sample_ordinals,
                                   runtime_config.expected_resolution,
+                                  runtime_config.validate_sample_ordinals,
                                   loaded_identity))
         {
             return false;
@@ -986,8 +1330,6 @@ try
             std::size_t task_upward_settled_nodes = 0;
             std::size_t task_downward_updates = 0;
             std::int64_t task_phast_elapsed_ms = 0;
-            std::int64_t task_upward_elapsed_ms = 0;
-            std::int64_t task_downward_elapsed_ms = 0;
 
             if (!run_phast_task(task_runtime,
                                 task_distances,
@@ -995,9 +1337,7 @@ try
                                 task_seed_stats,
                                 task_upward_settled_nodes,
                                 task_downward_updates,
-                                task_phast_elapsed_ms,
-                                task_upward_elapsed_ms,
-                                task_downward_elapsed_ms))
+                                task_phast_elapsed_ms))
             {
                 return EXIT_FAILURE;
             }
@@ -1013,6 +1353,7 @@ try
                                                 metric_name,
                                                 task_cap_metric,
                                                 task_distances,
+                                                task_phast_elapsed_ms,
                                                 batch_task.raster_output_path,
                                                 rasterization_stats,
                                                 cell_count,
@@ -1042,17 +1383,13 @@ try
     std::size_t upward_settled_nodes = 0;
     std::size_t downward_updates = 0;
     std::int64_t phast_elapsed = 0;
-    std::int64_t upward_elapsed_ms = 0;
-    std::int64_t downward_elapsed_ms = 0;
     if (!run_phast_task(runtime_config,
                         phast_distances,
                         cap_metric,
                         seed_stats,
                         upward_settled_nodes,
                         downward_updates,
-                        phast_elapsed,
-                        upward_elapsed_ms,
-                        downward_elapsed_ms))
+                        phast_elapsed))
     {
         return EXIT_FAILURE;
     }
@@ -1078,8 +1415,6 @@ try
                 << ", max distance: " << osrm::contractor::phast::MaxDistance(phast_distances)
                 << " ticks";
     util::Log() << "PHAST runtime: " << phast_elapsed << " ms";
-    util::Log() << "[timing] upward search (cap-bounded): " << upward_elapsed_ms << " ms";
-    util::Log() << "[timing] downward sweep (whole-graph): " << downward_elapsed_ms << " ms";
 
     if (runtime_config.has_raster_output_path)
     {
@@ -1100,7 +1435,6 @@ try
         std::size_t unreachable_cells = 0;
         std::size_t bytes_written = 0;
 
-        const auto t_raster_start = std::chrono::steady_clock::now();
         if (!writeDenseU16ArtifactFromSnapCache(runtime_config.sample_snap_cache,
                                                 runtime_config.expected_resolution,
                                                 phast_data.connectivity_checksum,
@@ -1108,6 +1442,7 @@ try
                                                 metric_name,
                                                 cap_metric,
                                                 phast_distances,
+                                                phast_elapsed,
                                                 runtime_config.raster_output_path,
                                                 rasterization_stats,
                                                 cell_count,
@@ -1117,8 +1452,6 @@ try
         {
             return EXIT_FAILURE;
         }
-        util::Log() << "[timing] rasterize (snap-cache -> u16): "
-                    << ms_between(t_raster_start, std::chrono::steady_clock::now()) << " ms";
 
         util::Log() << "Rasterized cells: " << cell_count;
         util::Log() << "Reachable cells: " << reachable_cells;

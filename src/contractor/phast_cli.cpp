@@ -53,10 +53,10 @@ ReturnCode ParseArguments(int argc,
         "Traversal cap in metric ticks (required for non-duration weight datasets)")(
         "exclude",
         boost::program_options::value<std::size_t>(&runtime_config.exclude_index),
-        "Expected exclude index (must match .osrm.phast)")(
+        "Expected exclude index (must match selected traversal artifact)")(
         "orientation",
         boost::program_options::value<std::string>(&runtime_config.orientation),
-        "Expected orientation: forward|reverse (must match .osrm.phast)")(
+        "Expected orientation: forward|reverse (must match selected traversal artifact)")(
         "output-format",
         boost::program_options::value<std::string>(&runtime_config.output_format)
             ->default_value("phastfield-v1"),
@@ -67,6 +67,9 @@ ReturnCode ParseArguments(int argc,
         "sample-ordinals",
         boost::program_options::value<std::filesystem::path>(&runtime_config.sample_ordinals),
         "Little-endian uint64 ordinal IDs file (h3_r<res>_ordinals.u64)")(
+        "validate-sample-ordinals",
+        boost::program_options::bool_switch(&runtime_config.validate_sample_ordinals),
+        "Diagnostic: rescan and validate every ordinal instead of trusting its identity sidecar")(
         "sample-snap-cache",
         boost::program_options::value<std::filesystem::path>(&runtime_config.sample_snap_cache),
         "Primary snap cache file for sample points")(
@@ -79,7 +82,11 @@ ReturnCode ParseArguments(int argc,
         "resolution",
         boost::program_options::value<std::uint32_t>(&runtime_config.expected_resolution)
             ->default_value(9),
-        "Expected H3 resolution in sample ordinals/cache (default 9)");
+        "Expected H3 resolution in sample ordinals/cache (default 9)")(
+        "iso-adj",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.iso_adj_path),
+        "Lean custom mode: memory-mapped edge-based adjacency (osrm-iso-adj output). "
+        "Runs a capped Dijkstra instead of the whole-graph PHAST sweep.");
 
     boost::program_options::options_description hidden_options("Hidden options");
     hidden_options.add_options()(
@@ -192,6 +199,10 @@ ReturnCode ParseArguments(int argc,
     {
         runtime_config.has_task_file = true;
     }
+    if (option_variables.contains("iso-adj"))
+    {
+        runtime_config.has_iso_adj = true;
+    }
 
     const bool has_manual_seeds = !runtime_config.seed_nodes.empty() || runtime_config.has_seed_file;
     if (runtime_config.has_task_file)
@@ -247,6 +258,20 @@ ReturnCode ParseArguments(int argc,
     {
         util::Log(logERROR) << "--resolution must be > 0.";
         return ReturnCode::Fail;
+    }
+    if (runtime_config.has_iso_adj)
+    {
+        if (runtime_config.has_task_file || has_manual_seeds || !runtime_config.has_poi_file)
+        {
+            util::Log(logERROR)
+                << "--iso-adj requires --poi-file and is incompatible with --task-file/--seed-*.";
+            return ReturnCode::Fail;
+        }
+        if (!runtime_config.has_raster_output_path)
+        {
+            util::Log(logERROR) << "--iso-adj requires --raster-output.";
+            return ReturnCode::Fail;
+        }
     }
     if (runtime_config.has_raster_output_path)
     {

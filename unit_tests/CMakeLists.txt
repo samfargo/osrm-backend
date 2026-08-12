@@ -177,7 +177,12 @@ target_link_libraries(library-customize-tests osrm_customize ${Boost_UNIT_TEST_F
 target_link_libraries(library-partition-tests osrm_partition ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
 target_link_libraries(server-tests osrm ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
 target_link_libraries(util-tests ${UTIL_LIBRARIES} ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
-target_link_libraries(contractor-tests osrm_contract ${CONTRACTOR_LIBRARIES} ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
+target_link_libraries(contractor-tests
+    osrm_contract
+    osrm
+    ${CONTRACTOR_LIBRARIES}
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
+    ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
 target_link_libraries(storage-tests osrm_store ${Boost_UNIT_TEST_FRAMEWORK_LIBRARY})
 
 if(BUILD_AS_SUBPROJECT)

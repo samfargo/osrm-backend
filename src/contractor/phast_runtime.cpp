@@ -1,5 +1,7 @@
 #include "contractor/phast_runtime.hpp"
 
+#include "engine/datafacade/contiguous_block_allocator.hpp"
+#include "engine/datafacade/mmap_memory_allocator.hpp"
 #include "engine/datafacade/process_memory_allocator.hpp"
 
 #include "storage/storage_config.hpp"
@@ -42,31 +44,28 @@ bool ClassifyArc(const contractor::PhastData &phast_data,
     return true;
 }
 
-bool OrientArc(const contractor::QueryEdge::EdgeData &edge_data,
-               contractor::PHASTOrientation orientation,
-               NodeID source,
-               NodeID target,
-               NodeID &oriented_source,
-               NodeID &oriented_target)
+bool UseArcForUpwardSearch(const contractor::QueryEdge::EdgeData &edge_data,
+                           contractor::PHASTOrientation orientation)
 {
     switch (orientation)
     {
     case contractor::PHASTOrientation::Forward:
-        if (!edge_data.forward)
-        {
-            return false;
-        }
-        oriented_source = source;
-        oriented_target = target;
-        return true;
+        return edge_data.forward;
     case contractor::PHASTOrientation::Reverse:
-        if (!edge_data.backward)
-        {
-            return false;
-        }
-        oriented_source = source;
-        oriented_target = target;
-        return true;
+        return edge_data.backward;
+    }
+    return false;
+}
+
+bool UseArcForDownwardSweep(const contractor::QueryEdge::EdgeData &edge_data,
+                            contractor::PHASTOrientation orientation)
+{
+    switch (orientation)
+    {
+    case contractor::PHASTOrientation::Forward:
+        return edge_data.backward;
+    case contractor::PHASTOrientation::Reverse:
+        return edge_data.forward;
     }
     return false;
 }
@@ -448,7 +447,8 @@ bool ResolveOrientation(const RuntimeConfig &runtime_config,
 bool LoadCHFacade(const std::filesystem::path &base_path,
                   const std::string &metric_name,
                   std::size_t exclude_index,
-                  std::shared_ptr<const CHDataFacade> &facade)
+                  std::shared_ptr<const CHDataFacade> &facade,
+                  bool use_mmap)
 {
     const storage::StorageConfig storage_config(base_path);
     if (!storage_config.IsValid())
@@ -459,7 +459,20 @@ bool LoadCHFacade(const std::filesystem::path &base_path,
 
     try
     {
-        auto allocator = std::make_shared<engine::datafacade::ProcessMemoryAllocator>(storage_config);
+        std::shared_ptr<engine::datafacade::ContiguousBlockAllocator> allocator;
+        if (use_mmap)
+        {
+            // Memory-mapped: only the pages actually touched (the spatial index +
+            // geometry used for snapping) become resident; the CH graph (.hsgr) is
+            // mapped but never faulted in by the lean iso-adj path.
+            allocator =
+                std::make_shared<engine::datafacade::MMapMemoryAllocator>(storage_config);
+        }
+        else
+        {
+            allocator =
+                std::make_shared<engine::datafacade::ProcessMemoryAllocator>(storage_config);
+        }
         facade = std::make_shared<const CHDataFacade>(allocator, metric_name, exclude_index);
     }
     catch (const std::exception &e)
@@ -505,9 +518,9 @@ bool DeriveAdjacency(const contractor::QueryGraph &graph,
 {
     const auto node_count = phast_data.node_count;
     std::vector<DerivedArc> upward_arcs;
-    std::vector<DerivedArc> pre_synthesis_downward_arcs;
+    std::vector<DerivedArc> downward_arcs;
     upward_arcs.reserve(graph.GetNumberOfEdges());
-    pre_synthesis_downward_arcs.reserve(graph.GetNumberOfEdges());
+    downward_arcs.reserve(graph.GetNumberOfEdges());
     adjacency.oriented_arc_count = 0;
     adjacency.skipped_self_loops = 0;
     adjacency.pre_synthesis_upward_arc_count = 0;
@@ -531,13 +544,13 @@ bool DeriveAdjacency(const contractor::QueryGraph &graph,
 
             const auto target = graph.GetTarget(edge);
             const auto &edge_data = graph.GetEdgeData(edge);
-            NodeID oriented_source = SPECIAL_NODEID;
-            NodeID oriented_target = SPECIAL_NODEID;
-            if (!OrientArc(edge_data, orientation, source, target, oriented_source, oriented_target))
+            const bool use_upward = UseArcForUpwardSearch(edge_data, orientation);
+            const bool use_downward = UseArcForDownwardSweep(edge_data, orientation);
+            if (!use_upward && !use_downward)
             {
                 continue;
             }
-            if (oriented_source == oriented_target)
+            if (source == target)
             {
                 ++adjacency.skipped_self_loops;
                 continue;
@@ -551,23 +564,29 @@ bool DeriveAdjacency(const contractor::QueryGraph &graph,
                 return false;
             }
 
-            ++adjacency.oriented_arc_count;
-
             bool is_upward = false;
-            if (!ClassifyArc(phast_data, oriented_source, oriented_target, is_upward))
+            if (!ClassifyArc(phast_data, source, target, is_upward))
             {
                 return false;
             }
-
-            const auto arc = DerivedArc{oriented_source, oriented_target, edge_weight};
-            if (is_upward)
+            if (!is_upward)
             {
-                upward_arcs.push_back(arc);
+                util::Log(logERROR)
+                    << "Encountered a downward CH edge while deriving PHAST adjacency: "
+                    << source << " -> " << target;
+                return false;
+            }
+
+            if (use_upward)
+            {
+                upward_arcs.push_back({source, target, edge_weight});
+                ++adjacency.oriented_arc_count;
                 ++adjacency.pre_synthesis_upward_arc_count;
             }
-            else
+            if (use_downward)
             {
-                pre_synthesis_downward_arcs.push_back(arc);
+                downward_arcs.push_back({target, source, edge_weight});
+                ++adjacency.oriented_arc_count;
                 ++adjacency.pre_synthesis_downward_arc_count;
             }
         }
@@ -579,36 +598,22 @@ bool DeriveAdjacency(const contractor::QueryGraph &graph,
         return false;
     }
 
-    util::Log() << "Pre-synthesis arc split: oriented=" << adjacency.oriented_arc_count
+    util::Log() << "Runtime arc split: oriented=" << adjacency.oriented_arc_count
                 << ", upward=" << adjacency.pre_synthesis_upward_arc_count
                 << ", downward=" << adjacency.pre_synthesis_downward_arc_count
                 << ", skipped_self_loops=" << adjacency.skipped_self_loops;
 
     // PHAST runtime graph contract:
-    // 1) Keep orientation-valid arcs that move upward in rank.
-    // 2) Build downward adjacency as the exact transpose of those upward arcs.
-    // This makes the derived downward DAG construction explicit and deterministic.
+    // 1) Upward search follows CH arcs valid for the requested graph orientation.
+    // 2) Downward sweep follows the opposite CH flag, transposed from high rank to low rank.
+    // For example, reverse isochrones search upward on `backward` arcs, then sweep down on
+    // transposed `forward` arcs.
     if (upward_arcs.empty())
     {
-        util::Log(logERROR) << "Pre-synthesis upward arc set is empty. Cannot build PHAST runtime DAG.";
+        util::Log(logERROR) << "Runtime upward arc set is empty. Cannot build PHAST runtime DAG.";
         return false;
     }
 
-    if (!pre_synthesis_downward_arcs.empty())
-    {
-        util::Log(logERROR)
-            << "Pre-synthesis downward arcs were found in orientation-filtered CH graph ("
-            << pre_synthesis_downward_arcs.size()
-            << "). This violates the current PHAST derivation contract.";
-        return false;
-    }
-
-    std::vector<DerivedArc> downward_arcs;
-    downward_arcs.reserve(upward_arcs.size());
-    for (const auto &arc : upward_arcs)
-    {
-        downward_arcs.push_back({arc.target, arc.source, arc.cost});
-    }
     adjacency.downward_built_from_transpose = true;
 
     BuildCSR(upward_arcs, node_count, adjacency.up_offsets, adjacency.up_targets, adjacency.up_costs);
