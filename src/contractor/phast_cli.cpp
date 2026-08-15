@@ -76,6 +76,9 @@ ReturnCode ParseArguments(int argc,
         "raster-output",
         boost::program_options::value<std::filesystem::path>(&runtime_config.raster_output_path),
         "Output dense little-endian uint16 artifact path (.u16)")(
+        "sparse-output",
+        boost::program_options::value<std::filesystem::path>(&runtime_config.sparse_output_path),
+        "Output versioned sparse custom-result path (.phs)")(
         "task-file",
         boost::program_options::value<std::filesystem::path>(&runtime_config.task_file),
         "TSV batch file rows: poi_file<tab>cap_seconds<tab>raster_output")(
@@ -86,7 +89,10 @@ ReturnCode ParseArguments(int argc,
         "iso-adj",
         boost::program_options::value<std::filesystem::path>(&runtime_config.iso_adj_path),
         "Lean custom mode: memory-mapped edge-based adjacency (osrm-iso-adj output). "
-        "Runs a capped Dijkstra instead of the whole-graph PHAST sweep.");
+        "Runs a capped Dijkstra instead of the whole-graph PHAST sweep.")(
+        "artifact-version",
+        boost::program_options::value<std::string>(&runtime_config.artifact_version),
+        "Expected immutable artifact version for sparse custom output");
 
     boost::program_options::options_description hidden_options("Hidden options");
     hidden_options.add_options()(
@@ -195,6 +201,10 @@ ReturnCode ParseArguments(int argc,
     {
         runtime_config.has_raster_output_path = true;
     }
+    if (option_variables.contains("sparse-output"))
+    {
+        runtime_config.has_sparse_output_path = true;
+    }
     if (option_variables.contains("task-file"))
     {
         runtime_config.has_task_file = true;
@@ -202,6 +212,10 @@ ReturnCode ParseArguments(int argc,
     if (option_variables.contains("iso-adj"))
     {
         runtime_config.has_iso_adj = true;
+    }
+    if (option_variables.contains("artifact-version"))
+    {
+        runtime_config.has_artifact_version = true;
     }
 
     const bool has_manual_seeds = !runtime_config.seed_nodes.empty() || runtime_config.has_seed_file;
@@ -267,11 +281,18 @@ ReturnCode ParseArguments(int argc,
                 << "--iso-adj requires --poi-file and is incompatible with --task-file/--seed-*.";
             return ReturnCode::Fail;
         }
-        if (!runtime_config.has_raster_output_path)
+        if (!runtime_config.has_sparse_output_path || runtime_config.has_raster_output_path ||
+            !runtime_config.has_artifact_version || runtime_config.artifact_version.empty())
         {
-            util::Log(logERROR) << "--iso-adj requires --raster-output.";
+            util::Log(logERROR)
+                << "--iso-adj requires --sparse-output and --artifact-version, and forbids --raster-output.";
             return ReturnCode::Fail;
         }
+    }
+    if (runtime_config.has_sparse_output_path && !runtime_config.has_iso_adj)
+    {
+        util::Log(logERROR) << "--sparse-output requires --iso-adj.";
+        return ReturnCode::Fail;
     }
     if (runtime_config.has_raster_output_path)
     {

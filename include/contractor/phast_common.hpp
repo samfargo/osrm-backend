@@ -50,6 +50,8 @@ struct RuntimeConfig final
     bool has_sample_snap_cache = false;
     std::filesystem::path raster_output_path;
     bool has_raster_output_path = false;
+    std::filesystem::path sparse_output_path;
+    bool has_sparse_output_path = false;
     std::filesystem::path task_file;
     bool has_task_file = false;
     std::uint32_t expected_resolution = 9;
@@ -58,6 +60,8 @@ struct RuntimeConfig final
     // whole-graph PHAST sweep. Only used for custom locations.
     std::filesystem::path iso_adj_path;
     bool has_iso_adj = false;
+    std::string artifact_version;
+    bool has_artifact_version = false;
 };
 
 enum class ReturnCode : unsigned

@@ -45,6 +45,7 @@
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/mman.h>
+#include <sys/resource.h>
 #endif
 
 using namespace osrm;
@@ -116,6 +117,49 @@ constexpr std::size_t SAMPLE_SNAP_CACHE_HEADER_BYTES =
 constexpr std::size_t RASTER_CHUNK_RECORDS = 1U << 18;
 constexpr std::size_t RASTER_PARALLEL_MIN_RECORDS = RASTER_CHUNK_RECORDS * 8;
 constexpr std::size_t MAX_RASTER_THREADS = 4;
+
+struct ProcessUsage
+{
+    std::uint64_t minor_page_faults = 0;
+    std::uint64_t major_page_faults = 0;
+    std::uint64_t peak_rss_kb = 0;
+};
+
+ProcessUsage readProcessUsage()
+{
+    ProcessUsage usage;
+#if defined(__unix__) || defined(__APPLE__)
+    struct rusage raw_usage = {};
+    if (::getrusage(RUSAGE_SELF, &raw_usage) == 0)
+    {
+        usage.minor_page_faults = static_cast<std::uint64_t>(raw_usage.ru_minflt);
+        usage.major_page_faults = static_cast<std::uint64_t>(raw_usage.ru_majflt);
+#if defined(__APPLE__)
+        usage.peak_rss_kb = static_cast<std::uint64_t>(raw_usage.ru_maxrss) / 1024;
+#else
+        usage.peak_rss_kb = static_cast<std::uint64_t>(raw_usage.ru_maxrss);
+#endif
+    }
+#endif
+    return usage;
+}
+
+std::optional<std::uint64_t> readProcessBytes()
+{
+#if defined(__linux__)
+    std::ifstream input("/proc/self/io");
+    std::string key;
+    std::uint64_t value = 0;
+    while (input >> key >> value)
+    {
+        if (key == "read_bytes:")
+        {
+            return value;
+        }
+    }
+#endif
+    return std::nullopt;
+}
 
 template <typename T> bool writeBinary(std::ostream &output, const T &value)
 {
@@ -902,16 +946,16 @@ bool writeDenseU16ArtifactFromSnapCache(const std::filesystem::path &sample_cach
 
 // ---------------------------------------------------------------------------
 // Lean custom-isochrone path (--iso-adj): capped Dijkstra over a memory-mapped
-// edge-based adjacency. Reuses the proven source snapping (BuildSeeds via an
-// mmap'd facade) and the dense-u16 rasterizer, replacing only the whole-graph
-// PHAST sweep with a region-bounded Dijkstra. See src/tools/iso_adj.cpp for the
-// exporter and the on-disk format.
+// edge-based adjacency followed by reached-state-only sparse cell reduction.
 // ---------------------------------------------------------------------------
 
 bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
                    const osrm::contractor::phast::RuntimeConfig &runtime_config)
 {
     namespace phast = osrm::contractor::phast;
+    const auto run_started = std::chrono::steady_clock::now();
+    const auto usage_started = readProcessUsage();
+    const auto read_bytes_started = readProcessBytes();
 
     extractor::ProfileProperties properties;
     extractor::files::readProfileProperties(phast_config.GetPath(".osrm.properties"), properties);
@@ -934,11 +978,15 @@ bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
         return false;
     }
 
+    const auto index_load_started = std::chrono::steady_clock::now();
     phast::IsoAdj adj;
     if (!phast::LoadIsoAdj(runtime_config.iso_adj_path, adj))
     {
         return false;
     }
+    const auto index_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - index_load_started)
+                                   .count();
     const auto &metadata = adj.metadata;
     if (metadata.metric_name != metric_name)
     {
@@ -948,6 +996,16 @@ bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
     if (metadata.metric_kind != runtime_metric_kind)
     {
         util::Log(logERROR) << "iso-adj metric kind differs from --metric.";
+        return false;
+    }
+    if (metadata.artifact_version != runtime_config.artifact_version)
+    {
+        util::Log(logERROR) << "iso-adj artifact version differs from --artifact-version.";
+        return false;
+    }
+    if (metadata.resolution != runtime_config.expected_resolution)
+    {
+        util::Log(logERROR) << "iso-adj resolution differs from --resolution.";
         return false;
     }
 
@@ -979,6 +1037,7 @@ bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
 
     // Snapping only: mmap the facade so the CH graph (.hsgr) is mapped but never
     // faulted in; the rtree + geometry pages touched by BuildSeeds stay tiny.
+    const auto facade_load_started = std::chrono::steady_clock::now();
     std::shared_ptr<const phast::CHDataFacade> facade;
     if (!phast::LoadCHFacade(phast_config.base_path,
                              metric_name,
@@ -988,6 +1047,9 @@ bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
     {
         return false;
     }
+    const auto facade_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - facade_load_started)
+                                    .count();
     if (facade->GetCheckSum() != metadata.connectivity_checksum)
     {
         util::Log(logERROR) << "Facade connectivity checksum (" << facade->GetCheckSum()
@@ -1013,16 +1075,7 @@ bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
         return false;
     }
 
-    OrdinalsIdentity ordinals_identity;
-    if (!loadOrdinalsIdentity(
-            runtime_config.sample_ordinals,
-            runtime_config.expected_resolution,
-            runtime_config.validate_sample_ordinals,
-            ordinals_identity))
-    {
-        return false;
-    }
-
+    const auto seed_started = std::chrono::steady_clock::now();
     std::vector<phast::PHASTSeed> seeds;
     phast::SeedBuildStats seed_stats;
     if (!phast::BuildSeeds(runtime_config,
@@ -1036,6 +1089,23 @@ bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
     {
         return false;
     }
+    for (auto &seed : seeds)
+    {
+        if (seed.node >= metadata.node_count)
+        {
+            util::Log(logERROR) << "Snapped seed is outside the iso-adj node map.";
+            return false;
+        }
+        seed.node = adj.original_to_spatial[seed.node];
+        if (seed.node >= metadata.node_count)
+        {
+            util::Log(logERROR) << "Snapped seed maps outside the iso-adj graph.";
+            return false;
+        }
+    }
+    const auto seed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - seed_started)
+                             .count();
 
     std::optional<EdgeWeight> cap_metric;
     if (!phast::ParseTraversalCap(runtime_config, properties, runtime_metric_kind, cap_metric))
@@ -1044,41 +1114,93 @@ bool RunIsoAdjMode(const osrm::contractor::phast::PhastConfig &phast_config,
     }
 
     const auto t_search_start = std::chrono::steady_clock::now();
-    std::vector<EdgeWeight> distances;
-    phast::RunCappedDijkstraIsoAdj(adj, seeds, cap_metric, distances);
+    std::vector<phast::ReachedState> reached;
+    if (!phast::RunCappedDijkstraIsoAdj(adj, seeds, cap_metric, reached))
+    {
+        return false;
+    }
     const auto t_search_done = std::chrono::steady_clock::now();
     const auto search_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(t_search_done - t_search_start)
             .count();
     util::Log() << "[iso-adj] capped Dijkstra: " << search_ms
-                << " ms, reachable nodes: "
-                << osrm::contractor::phast::CountReachable(distances);
+                << " ms, reachable nodes: " << reached.size();
 
-    RasterizationStats stats;
-    std::size_t cell_count = 0;
-    std::size_t reachable_cells = 0;
-    std::size_t unreachable_cells = 0;
-    std::size_t bytes_written = 0;
-    if (!writeDenseU16ArtifactFromSnapCache(runtime_config.sample_snap_cache,
-                                            runtime_config.expected_resolution,
-                                            metadata.connectivity_checksum,
-                                            ordinals_identity,
-                                            metric_name,
-                                            cap_metric,
-                                            distances,
-                                            search_ms,
-                                            runtime_config.raster_output_path,
-                                            stats,
-                                            cell_count,
-                                            reachable_cells,
-                                            unreachable_cells,
-                                            bytes_written))
+    const auto reduction_started = std::chrono::steady_clock::now();
+    std::vector<phast::SparseResultRecord> records;
+    if (!phast::ReduceReachedCells(adj, reached, cap_metric, records))
+    {
+        return false;
+    }
+    const auto reduction_done = std::chrono::steady_clock::now();
+    const auto reduction_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(reduction_done - reduction_started)
+            .count();
+    const auto cap_seconds = runtime_config.has_cap_seconds
+                                 ? static_cast<std::uint32_t>(
+                                       std::nearbyint(runtime_config.cap_seconds))
+                                 : std::numeric_limits<std::uint32_t>::max();
+    if (!phast::WriteSparseResult(
+            runtime_config.sparse_output_path, metadata, cap_seconds, records))
     {
         return false;
     }
 
-    util::Log() << "[iso-adj] raster cells=" << cell_count << " reachable=" << reachable_cells
-                << " unreachable=" << unreachable_cells << " bytes=" << bytes_written;
+    auto metadata_path =
+        std::filesystem::path{runtime_config.sparse_output_path.string() + ".meta.json"};
+    auto metadata_tmp = std::filesystem::path{metadata_path.string() + ".tmp"};
+    std::ofstream output(metadata_tmp, std::ios::trunc);
+    const auto bytes_written = sizeof(phast::SparseResultFileHeader) +
+                               records.size() * sizeof(phast::SparseResultRecord);
+    const auto usage_finished = readProcessUsage();
+    const auto read_bytes_finished = readProcessBytes();
+    const auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - run_started)
+                              .count();
+    const auto minor_page_faults = usage_finished.minor_page_faults >=
+                                           usage_started.minor_page_faults
+                                       ? usage_finished.minor_page_faults -
+                                             usage_started.minor_page_faults
+                                       : 0;
+    const auto major_page_faults = usage_finished.major_page_faults >=
+                                           usage_started.major_page_faults
+                                       ? usage_finished.major_page_faults -
+                                             usage_started.major_page_faults
+                                       : 0;
+    const auto read_bytes = read_bytes_started && read_bytes_finished &&
+                                    *read_bytes_finished >= *read_bytes_started
+                                ? *read_bytes_finished - *read_bytes_started
+                                : 0;
+    output << "{\"reachable_states\":" << reached.size()
+           << ",\"reachable_cells\":" << records.size()
+           << ",\"bytes\":" << bytes_written
+           << ",\"total_ms\":" << total_ms
+           << ",\"index_load_ms\":" << index_load_ms
+           << ",\"facade_load_ms\":" << facade_load_ms
+           << ",\"seed_ms\":" << seed_ms
+           << ",\"traversal_ms\":" << search_ms
+           << ",\"sparse_reduction_ms\":" << reduction_ms
+           << ",\"minor_page_faults\":" << minor_page_faults
+           << ",\"major_page_faults\":" << major_page_faults
+           << ",\"peak_rss_kb\":" << usage_finished.peak_rss_kb
+           << ",\"read_bytes\":" << read_bytes << "}\n";
+    output.close();
+    if (!output)
+    {
+        util::Log(logERROR) << "Failed writing sparse result metadata: " << metadata_tmp.string();
+        return false;
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(metadata_tmp, metadata_path, rename_error);
+    if (rename_error)
+    {
+        util::Log(logERROR) << "Failed publishing sparse result metadata: "
+                            << rename_error.message();
+        return false;
+    }
+
+    util::Log() << "[iso-adj] sparse cells=" << records.size() << " bytes=" << bytes_written
+                << " reduction_ms=" << reduction_ms;
     return true;
 }
 } // namespace
